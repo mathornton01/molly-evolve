@@ -36,7 +36,10 @@ class LoRALearner(ContinualLearner):
         logger.info(f"[lora] Loading {self.model_name}...")
         t0 = time.perf_counter()
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name).to(self.device)
+            self.model_name, torch_dtype=torch.float16).to(self.device)
+        n_params = sum(p.numel() for p in self.model.parameters())
+        if n_params > 1e9:
+            self.model.gradient_checkpointing_enable()
         dt = time.perf_counter() - t0
         logger.info(f"[lora] Model loaded in {dt:.1f}s")
 
@@ -84,7 +87,6 @@ class LoRALearner(ContinualLearner):
 
         optimizer = torch.optim.AdamW(
             [p for p in peft_model.parameters() if p.requires_grad], lr=lr)
-        scaler = GradScaler() if self.device.type == "cuda" else None
 
         ids = train_enc["input_ids"].to(self.device)
         mask = train_enc["attention_mask"].to(self.device)
@@ -97,14 +99,13 @@ class LoRALearner(ContinualLearner):
                 batch_mask = mask[i:i+batch_size]
 
                 optimizer.zero_grad()
-                if self.device.type == "cuda" and scaler is not None:
-                    from torch.amp import autocast
+                from torch.amp import autocast
+                if self.device.type == "cuda":
                     with autocast("cuda", dtype=torch.float16):
                         out = peft_model(batch_ids, attention_mask=batch_mask,
                                          labels=batch_ids)
-                    scaler.scale(out.loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
+                    out.loss.backward()
+                    optimizer.step()
                 else:
                     out = peft_model(batch_ids, attention_mask=batch_mask,
                                      labels=batch_ids)
@@ -116,7 +117,7 @@ class LoRALearner(ContinualLearner):
 
         # Merge adapter into base model
         self.model = peft_model.merge_and_unload()
-        del optimizer, scaler, peft_model
+        del optimizer, peft_model
 
         dt = time.perf_counter() - t0
         avg_loss = total_loss / max(n_steps, 1)

@@ -40,7 +40,12 @@ class GeneConvLearner(ContinualLearner):
         logger.info(f"[gene-conv] Loading {self.model_name}...")
         t0 = time.perf_counter()
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name).to(self.device)
+            self.model_name, torch_dtype=torch.float16).to(self.device)
+        # Enable gradient checkpointing for large models
+        n_params = sum(p.numel() for p in self.model.parameters())
+        if n_params > 1e9:
+            self.model.gradient_checkpointing_enable()
+            logger.info(f"[gene-conv] Gradient checkpointing enabled ({n_params/1e9:.1f}B params)")
         dt = time.perf_counter() - t0
         logger.info(f"[gene-conv] Model loaded in {dt:.1f}s")
 
@@ -56,11 +61,23 @@ class GeneConvLearner(ContinualLearner):
                                  use_amp=True, streaming=self.streaming)
         logger.info(f"[gene-conv] Snapshot: {time.perf_counter()-t0:.3f}s")
 
+    def _make_optimizer(self, lr):
+        """Create optimizer — 8-bit Adam for large models, standard AdamW otherwise."""
+        n_params = sum(p.numel() for p in self.model.parameters())
+        if n_params > 1e9:
+            try:
+                import bitsandbytes as bnb
+                logger.info(f"[gene-conv] Using 8-bit Adam (model has {n_params/1e9:.1f}B params)")
+                return bnb.optim.Adam8bit(self.model.parameters(), lr=lr)
+            except ImportError:
+                logger.warning("[gene-conv] bitsandbytes not available, using AdamW")
+        return torch.optim.AdamW(self.model.parameters(), lr=lr)
+
     def train_domain(self, train_enc: dict, epochs: int = 3,
                      lr: float = 5e-5, batch_size: int = 1) -> dict:
         t0 = time.perf_counter()
         self.model.train()
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr)
+        optimizer = self._make_optimizer(lr)
         scaler = GradScaler() if self.device.type == "cuda" else None
 
         ids = train_enc["input_ids"].to(self.device)
