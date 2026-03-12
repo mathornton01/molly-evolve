@@ -1,14 +1,17 @@
 """
-GeneScorer — vectorized gene scoring with C++ acceleration.
+GeneScorer — Bayesian gene scoring with empirical Bayes shrinkage.
+
+Scoring pipeline:
+  1. Taylor approximation: delta_g ~ grad(L) . (w_complement - w_primary)
+  2. Split-half noise estimation: score on two data halves independently
+  3. Empirical Bayes: shrink gene effects toward population mean
+
+The posterior P(deleterious | data) and P(beneficial | data) are properly
+calibrated probabilities that account for observation noise.
 
 Supports two memory modes:
   - precomputed: all deltas on GPU (fast, O(N_params) GPU memory)
   - streaming: deltas computed on-the-fly (low memory, one param at a time)
-
-Auto-selects streaming for models >500M params.
-
-On CUDA: single kernel launch per scoring call (precomputed mode).
-On CPU: falls back to optimized Python with GPU tensor ops.
 """
 
 import logging
@@ -40,13 +43,18 @@ def _gpu_mem_mb():
 
 class GeneScorer:
     """
-    Fast gene scoring via gradient approximation.
+    Bayesian gene scoring via gradient approximation + empirical Bayes.
 
     Uses first-order Taylor expansion to approximate chimeric evaluation:
         delta_loss_g ~ grad_L . (w_complement - w_primary)
 
-    This replaces O(N_genes * N_objectives) forward passes with
-    O(N_objectives) forward+backward passes.
+    Then applies empirical Bayes shrinkage to produce calibrated posterior
+    probabilities P(deleterious | data) and P(beneficial | data).
+
+    The noise variance is estimated via split-half scoring: the eval data
+    is split in two, scored independently, and the disagreement between
+    halves estimates observation noise. This separates true signal (tau^2)
+    from noise (sigma^2), enabling proper shrinkage.
 
     Args:
         genome: DualGenome instance (or TransformerDualGenome).
@@ -155,11 +163,7 @@ class GeneScorer:
     # ── Streaming mode (low memory) ──────────────────────────────
 
     def _build_ref_map(self):
-        """Build lightweight reference map for streaming mode.
-
-        Stores gene object references instead of materialized delta tensors.
-        Gene objects are updated in-place by sync_primary, so refs stay valid.
-        """
+        """Build lightweight reference map for streaming mode."""
         t0 = time.perf_counter()
         self.param_gene_refs = {}
 
@@ -177,7 +181,7 @@ class GeneScorer:
         dt = time.perf_counter() - t0
         logger.info(f"  build_ref_map: {dt:.3f}s | GPU: {_gpu_mem_mb():.0f} MB")
 
-    # ── Scoring ──────────────────────────────────────────────────
+    # ── Low-level scoring ────────────────────────────────────────
 
     def _score_one_eval(self, enc) -> np.ndarray:
         """One forward+backward -> all gene scores."""
@@ -241,10 +245,7 @@ class GeneScorer:
         return gene_scores.cpu().numpy()
 
     def _score_python_streaming(self) -> np.ndarray:
-        """Streaming scoring: compute deltas on-the-fly, one param at a time.
-
-        Peak GPU memory = model + gradients + ONE delta tensor (not all).
-        """
+        """Streaming scoring: compute deltas on-the-fly, one param at a time."""
         gene_scores = torch.zeros(self.n_genes, device=self.device)
         params_dict = dict(self.model.named_parameters())
 
@@ -255,7 +256,6 @@ class GeneScorer:
             grad_f = grad.float()
 
             for gid, dim, start, end, comp_key, gene in entries:
-                # Compute delta on-the-fly from int16 strands (CPU -> GPU)
                 comp = gene._dequantize(gene.complement[comp_key],
                                         gene.scales[comp_key])
                 prim = gene._dequantize(gene.primary[comp_key],
@@ -268,14 +268,135 @@ class GeneScorer:
                     g_slice = grad_f
 
                 gene_scores[gid] += (g_slice * delta).sum()
-                del delta, comp, prim  # free immediately
+                del delta, comp, prim
 
         return gene_scores.cpu().numpy()
+
+    # ── Split-half noise estimation ──────────────────────────────
+
+    def _score_split_half(self, enc) -> Tuple[np.ndarray, float]:
+        """
+        Score with split-half noise estimation.
+
+        Splits eval data into two halves, scores each independently.
+        The disagreement between halves estimates observation noise.
+
+        Returns:
+            (combined_scores, noise_variance)
+            combined_scores: average of two half-scores (= full-data estimate)
+            noise_variance: estimated variance of the combined score's noise
+        """
+        n_samples = enc["input_ids"].size(0)
+
+        if n_samples < 4:
+            # Too few to split — fall back to single score with heuristic noise
+            scores = self._score_one_eval(enc)
+            if np.any(np.isnan(scores)):
+                logger.warning(f"    NaN in gene scores, replacing with 0")
+                scores = np.nan_to_num(scores, nan=0.0)
+            noise_var = max(np.var(scores) * 0.1, 1e-10)
+            logger.info(f"    (< 4 samples, heuristic noise estimate)")
+            return scores, noise_var
+
+        mid = n_samples // 2
+        enc_a = {"input_ids": enc["input_ids"][:mid],
+                 "attention_mask": enc["attention_mask"][:mid]}
+        enc_b = {"input_ids": enc["input_ids"][mid:2*mid],
+                 "attention_mask": enc["attention_mask"][mid:2*mid]}
+
+        scores_a = self._score_one_eval(enc_a)
+        scores_b = self._score_one_eval(enc_b)
+
+        # Guard against NaN from degenerate forward passes
+        if np.any(np.isnan(scores_a)) or np.any(np.isnan(scores_b)):
+            logger.warning(f"    NaN in split-half scores, replacing with 0")
+            scores_a = np.nan_to_num(scores_a, nan=0.0)
+            scores_b = np.nan_to_num(scores_b, nan=0.0)
+
+        # Combined = average of halves (equals full-data estimate for linear ops)
+        combined = (scores_a + scores_b) / 2
+
+        # Noise estimation:
+        # Each half has noise sigma^2_half. The combined average has sigma^2_half/2.
+        # Var(A - B) = 2 * sigma^2_half, so sigma^2_combined = Var(A-B) / 4
+        diff = scores_a - scores_b
+        noise_var = max(np.var(diff) / 4, 1e-10)
+
+        # Diagnostic: split-half correlation
+        std_a, std_b = np.std(scores_a), np.std(scores_b)
+        if std_a > 1e-10 and std_b > 1e-10:
+            r = np.corrcoef(scores_a, scores_b)[0, 1]
+            logger.info(f"    split-half r={r:.3f}")
+
+        return combined, noise_var
+
+    # ── Empirical Bayes ──────────────────────────────────────────
+
+    @staticmethod
+    def _empirical_bayes(raw_deltas: np.ndarray, noise_var: float
+                         ) -> Tuple[np.ndarray, float, dict]:
+        """
+        Empirical Bayes shrinkage estimator for gene effects.
+
+        Generative model:
+            Prior:      mu_g ~ Normal(mu_0, tau^2)
+            Likelihood: d_g | mu_g ~ Normal(mu_g, sigma^2)
+            Posterior:  mu_g | d_g ~ Normal(B*d + (1-B)*mu_0, B*sigma^2)
+
+        where B = tau^2 / (tau^2 + sigma^2) is the shrinkage factor.
+
+        Parameters are estimated from data:
+            mu_0 = mean(d)              [prior mean]
+            tau^2 = Var(d) - sigma^2    [signal variance, method of moments]
+            sigma^2 = noise_var         [from split-half estimation]
+
+        Args:
+            raw_deltas: observed deltas for all genes, shape (n_genes,)
+            noise_var: observation noise variance (from split-half)
+
+        Returns:
+            posterior_mean: shrunk estimates, shape (n_genes,)
+            posterior_var: scalar posterior variance
+            diagnostics: dict with prior params and shrinkage factor
+        """
+        mu_0 = np.mean(raw_deltas)
+        total_var = np.var(raw_deltas)
+
+        # Signal variance via method of moments: Var(d) = tau^2 + sigma^2
+        tau2 = max(total_var - noise_var, 0.0)
+
+        # Shrinkage factor
+        denom = tau2 + noise_var
+        B = tau2 / denom if denom > 1e-10 else 0.0
+
+        # Posterior
+        posterior_mean = B * raw_deltas + (1 - B) * mu_0
+        posterior_var = max(B * noise_var, 1e-10)
+
+        diagnostics = {
+            "prior_mean": float(mu_0),
+            "signal_var_tau2": float(tau2),
+            "noise_var_sigma2": float(noise_var),
+            "total_var": float(total_var),
+            "shrinkage_B": float(B),
+            "snr": float(tau2 / noise_var) if noise_var > 1e-10 else float('inf'),
+        }
+
+        return posterior_mean, posterior_var, diagnostics
+
+    # ── Main scoring API ─────────────────────────────────────────
 
     def score_multi_objective(self, eval_sets, curr_eval,
                               threshold=0.50, alpha=0.3):
         """
-        Score all genes against multiple objectives.
+        Score all genes using empirical Bayes with split-half noise estimation.
+
+        For each objective (previous domains + current domain):
+          1. Split eval data in half, score each half independently
+          2. Estimate noise variance from half-score disagreement
+          3. Separate signal (tau^2) from noise (sigma^2)
+          4. Apply shrinkage: posterior_mean = B*d + (1-B)*mu_0
+          5. Compute calibrated P(deleterious | data) or P(beneficial | data)
 
         Args:
             eval_sets: list of (name, encodings) for objectives to protect.
@@ -287,57 +408,69 @@ class GeneScorer:
         t0 = time.perf_counter()
         self._raw_genome.sync_primary()
 
-        # Only rebuild precomputed deltas (streaming refs stay valid)
         if not self.streaming:
             self._build_repair_map()
 
-        # Score against all previous objectives
-        all_prev = {}
-        for name, enc in eval_sets:
-            t1 = time.perf_counter()
-            all_prev[name] = self._score_one_eval(enc)
-            logger.info(f"  scored '{name}': {time.perf_counter()-t1:.3f}s")
-
-        # Score against current domain
-        t1 = time.perf_counter()
-        curr_scores = self._score_one_eval(curr_eval)
-        logger.info(f"  scored 'current': {time.perf_counter()-t1:.3f}s")
-
-        # Convert to Bayesian posteriors
         prev_names = [name for name, _ in eval_sets]
         n = self.n_genes
 
-        raw_scores = []
-        for gid in range(n):
-            deltas_prev = {name: float(-all_prev[name][gid])
-                           for name in prev_names}
-            delta_curr = float(curr_scores[gid])
-            raw_scores.append({"gene_id": gid, "deltas_prev": deltas_prev,
-                               "delta_curr": delta_curr})
+        # Score each previous objective with split-half noise estimation
+        all_prev_scores = {}
+        all_prev_noise = {}
+        for name, enc in eval_sets:
+            t1 = time.perf_counter()
+            scores, noise_var = self._score_split_half(enc)
+            all_prev_scores[name] = scores
+            all_prev_noise[name] = noise_var
+            logger.info(f"  scored '{name}': {time.perf_counter()-t1:.3f}s")
 
-        var_prev = {name: max(np.var([s["deltas_prev"][name]
-                                      for s in raw_scores]), 1e-10)
-                    for name in prev_names}
-        var_curr = max(np.var([s["delta_curr"] for s in raw_scores]), 1e-10)
+        # Score current domain
+        t1 = time.perf_counter()
+        curr_scores, noise_var_curr = self._score_split_half(curr_eval)
+        logger.info(f"  scored 'current': {time.perf_counter()-t1:.3f}s")
 
+        # Empirical Bayes for each previous objective -> P(deleterious)
+        p_del_all = {}
+        for name in prev_names:
+            # Negate: positive = repairing helps this domain = gene was deleterious
+            raw_deltas = -all_prev_scores[name]
+            post_mean, post_var, diag = self._empirical_bayes(
+                raw_deltas, all_prev_noise[name])
+            post_std = np.sqrt(post_var)
+
+            # P(true effect > 0 | data) = P(gene is deleterious to this domain)
+            p_del_all[name] = 1 - stats.norm.cdf(
+                0, loc=post_mean, scale=post_std)
+
+            logger.info(f"    '{name}' Bayes: B={diag['shrinkage_B']:.3f}, "
+                        f"SNR={diag['snr']:.2f}, "
+                        f"tau2={diag['signal_var_tau2']:.2e}, "
+                        f"sigma2={diag['noise_var_sigma2']:.2e}")
+
+        # Empirical Bayes for current domain -> P(beneficial)
+        # Positive raw score = repair increases loss = gene benefits current domain
+        post_mean_c, post_var_c, diag_c = self._empirical_bayes(
+            curr_scores, noise_var_curr)
+        post_std_c = np.sqrt(post_var_c)
+
+        p_ben = 1 - stats.norm.cdf(0, loc=post_mean_c, scale=post_std_c)
+
+        logger.info(f"    'current' Bayes: B={diag_c['shrinkage_B']:.3f}, "
+                    f"SNR={diag_c['snr']:.2f}")
+
+        # Combine: take max P(deleterious) across all protected domains
         scores = []
-        for s in raw_scores:
-            p_del = {}
-            for name in prev_names:
-                sig = np.sqrt(var_prev[name] / 2)
-                p_del[name] = 1 - stats.norm.cdf(
-                    0, loc=s["deltas_prev"][name] / 2, scale=sig)
-            p_del_prev = max(p_del.values())
-            sig_c = np.sqrt(var_curr / 2)
-            p_ben_curr = 1 - stats.norm.cdf(
-                0, loc=s["delta_curr"] / 2, scale=sig_c)
-            scores.append({"gene_id": s["gene_id"],
-                           "p_del_prev": p_del_prev,
-                           "p_ben_curr": p_ben_curr})
+        for gid in range(n):
+            p_del_prev = max(p_del_all[name][gid] for name in prev_names)
+            scores.append({
+                "gene_id": gid,
+                "p_del_prev": float(p_del_prev),
+                "p_ben_curr": float(p_ben[gid]),
+            })
 
         dt = time.perf_counter() - t0
-        logger.info(f"  total scoring: {dt:.3f}s | {n} genes × "
-                    f"{len(eval_sets)+1} objectives")
+        logger.info(f"  total scoring: {dt:.3f}s | {n} genes x "
+                    f"{len(eval_sets)+1} objectives (Bayesian)")
         return scores
 
     def memory_estimate(self) -> dict:
@@ -351,11 +484,10 @@ class GeneScorer:
         genome_cpu_mb = n_params * 4 / 1024 / 1024  # primary + complement int16
 
         if self.streaming:
-            # Only one delta at a time
             max_param = max(p.numel() for p in self.model.parameters())
             delta_mb = max_param * 4 / 1024 / 1024
         else:
-            delta_mb = n_params * 4 / 1024 / 1024  # all deltas
+            delta_mb = n_params * 4 / 1024 / 1024
 
         return {
             "model_gpu_mb": model_mb,

@@ -522,7 +522,200 @@ class TestCLIArgs:
         assert args.gc_batch_size == 10
 
 
-# ── 7. End-to-end integration (CPU, quicktest) ──────────────────
+# ── 7. Training NaN detection ────────────────────────────────────
+
+
+class TestTrainingNaN:
+    """Test training abort on persistent NaN."""
+
+    def test_nan_streak_detection(self):
+        """Simulate the NaN streak detection from the training loop."""
+        nan_streak = 0
+        training_aborted = False
+        # Simulate 25 NaN losses in a row
+        for i in range(25):
+            loss_val = float('nan')
+            if math.isnan(loss_val) or math.isinf(loss_val):
+                nan_streak += 1
+                if nan_streak >= 20:
+                    training_aborted = True
+                    break
+            else:
+                nan_streak = 0
+        assert training_aborted, "Should abort after 20 consecutive NaN"
+        assert nan_streak == 20
+
+    def test_nan_streak_resets_on_valid_loss(self):
+        """A valid loss should reset the NaN streak counter."""
+        nan_streak = 0
+        training_aborted = False
+        losses = [float('nan')] * 15 + [2.5] + [float('nan')] * 15
+        for loss_val in losses:
+            if math.isnan(loss_val) or math.isinf(loss_val):
+                nan_streak += 1
+                if nan_streak >= 20:
+                    training_aborted = True
+                    break
+            else:
+                nan_streak = 0
+        assert not training_aborted, "Should not abort: streak resets at valid loss"
+
+    def test_post_training_stability_check(self):
+        """Post-training stability check catches NaN model."""
+        model = make_tiny_model()
+        enc = make_sample_encoding(batch=2)
+
+        # Corrupt model
+        with torch.no_grad():
+            for p in model.parameters():
+                p.fill_(float('nan'))
+
+        model.eval()
+        post_train_stable = True
+        with torch.no_grad():
+            for k in range(min(2, enc["input_ids"].size(0))):
+                out = model(enc["input_ids"][k:k+1], labels=enc["input_ids"][k:k+1])
+                if math.isnan(out.loss.item()) or math.isinf(out.loss.item()):
+                    post_train_stable = False
+                    break
+
+        assert not post_train_stable, "Should detect NaN model"
+
+    def test_evaluate_ppl_cpu(self):
+        """evaluate_ppl should work on CPU without CUDA autocast."""
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "experiments"))
+        import importlib
+        import full_comparison
+        importlib.reload(full_comparison)
+
+        model = make_tiny_model()
+        enc = make_sample_encoding()
+        ppl = full_comparison.evaluate_ppl(model, enc, torch.device("cpu"))
+        assert ppl > 0 and not math.isnan(ppl) and not math.isinf(ppl)
+
+
+# ── 8. Empirical Bayes scoring ───────────────────────────────────
+
+
+class TestEmpiricalBayes:
+    """Test the Bayesian scoring components."""
+
+    def test_shrinkage_high_snr(self):
+        """High SNR: shrinkage factor B should be near 1 (trust the data)."""
+        from molly_evolution.scoring import GeneScorer
+        # Large signal, small noise
+        raw = np.array([0.0, 1.0, 2.0, 3.0, 10.0, -5.0, 4.0, 6.0])
+        noise_var = 0.01  # very low noise
+        post_mean, post_var, diag = GeneScorer._empirical_bayes(raw, noise_var)
+        assert diag["shrinkage_B"] > 0.9, f"B should be ~1 for high SNR, got {diag['shrinkage_B']}"
+        # Posterior should be close to raw data
+        assert np.allclose(post_mean, raw, atol=0.5)
+
+    def test_shrinkage_low_snr(self):
+        """Low SNR: shrinkage factor B should be near 0 (shrink to mean)."""
+        from molly_evolution.scoring import GeneScorer
+        # Small signal, large noise
+        raw = np.array([0.01, -0.02, 0.015, -0.005, 0.008, -0.01])
+        noise_var = 1.0  # much larger than signal
+        post_mean, post_var, diag = GeneScorer._empirical_bayes(raw, noise_var)
+        assert diag["shrinkage_B"] < 0.1, f"B should be ~0 for low SNR, got {diag['shrinkage_B']}"
+        # Posterior should be close to the population mean
+        mu_0 = np.mean(raw)
+        assert np.allclose(post_mean, mu_0, atol=0.01)
+
+    def test_shrinkage_preserves_ranking(self):
+        """Shrinkage should preserve the ranking of gene effects."""
+        from molly_evolution.scoring import GeneScorer
+        raw = np.array([5.0, 1.0, 3.0, 0.5, 4.0])
+        noise_var = 0.5
+        post_mean, _, _ = GeneScorer._empirical_bayes(raw, noise_var)
+        # Rankings should be preserved
+        raw_order = np.argsort(raw)
+        post_order = np.argsort(post_mean)
+        assert np.array_equal(raw_order, post_order), "Shrinkage should preserve ranking"
+
+    def test_zero_signal_all_shrunk_to_mean(self):
+        """When tau^2 = 0, all posteriors should equal the population mean."""
+        from molly_evolution.scoring import GeneScorer
+        # All identical values -> zero signal variance
+        raw = np.array([1.0, 1.0, 1.0, 1.0])
+        noise_var = 0.5
+        post_mean, _, diag = GeneScorer._empirical_bayes(raw, noise_var)
+        assert diag["shrinkage_B"] == 0.0
+        assert np.allclose(post_mean, 1.0)
+
+    def test_posterior_probabilities_calibrated(self):
+        """P(del) should be high for large positive deltas, low for negative."""
+        from molly_evolution.scoring import GeneScorer
+        from scipy import stats as sp_stats
+        raw = np.array([-3.0, -1.0, 0.0, 1.0, 3.0])
+        noise_var = 0.5
+        post_mean, post_var, _ = GeneScorer._empirical_bayes(raw, noise_var)
+        post_std = np.sqrt(post_var)
+        p_positive = 1 - sp_stats.norm.cdf(0, loc=post_mean, scale=post_std)
+        # Gene with delta=3.0 should have high P(positive)
+        assert p_positive[4] > 0.8, f"Large positive delta should have high P, got {p_positive[4]}"
+        # Gene with delta=-3.0 should have low P(positive)
+        assert p_positive[0] < 0.2, f"Large negative delta should have low P, got {p_positive[0]}"
+
+    def test_split_half_scoring(self):
+        """Split-half should produce valid scores and noise estimate."""
+        from molly_evolution.scoring import GeneScorer
+        from molly_evolution.genome import DualGenome
+
+        model = make_tiny_model()
+        device = torch.device("cpu")
+        genome = DualGenome(model, granularity="component", backend="python")
+        genome.snapshot()
+
+        # Perturb model slightly
+        with torch.no_grad():
+            for p in model.parameters():
+                p.add_(torch.randn_like(p) * 0.01)
+        genome.sync_primary()
+
+        scorer = GeneScorer(genome, model, device, use_amp=False, streaming=False)
+        enc = make_sample_encoding(batch=8, seq_len=32, vocab=1000)
+
+        scores, noise_var = scorer._score_split_half(enc)
+        assert len(scores) == genome.total_genes
+        assert noise_var > 0, "Noise variance should be positive"
+        assert not np.any(np.isnan(scores)), "Scores should not contain NaN"
+
+    def test_full_bayesian_pipeline(self):
+        """Full Bayesian scoring pipeline should return valid probabilities."""
+        from molly_evolution.scoring import GeneScorer
+        from molly_evolution.genome import DualGenome
+
+        model = make_tiny_model()
+        device = torch.device("cpu")
+        genome = DualGenome(model, granularity="component", backend="python")
+        genome.snapshot()
+
+        # Train a bit
+        model.train()
+        optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
+        enc = make_sample_encoding(batch=8, seq_len=32, vocab=1000)
+        for j in range(3):
+            optimizer.zero_grad()
+            out = model(enc["input_ids"][j:j+1], labels=enc["input_ids"][j:j+1])
+            out.loss.backward()
+            optimizer.step()
+
+        genome.sync_primary()
+        scorer = GeneScorer(genome, model, device, use_amp=False, streaming=False)
+        general_enc = make_sample_encoding(batch=8, seq_len=32, vocab=1000)
+
+        scores = scorer.score_multi_objective(
+            [("general", general_enc)], enc, threshold=0.80, alpha=0.3)
+
+        assert len(scores) == genome.total_genes
+        for s in scores:
+            assert 0 <= s["p_del_prev"] <= 1, f"p_del out of range: {s['p_del_prev']}"
+            assert 0 <= s["p_ben_curr"] <= 1, f"p_ben out of range: {s['p_ben_curr']}"
+
+
+# ── 9. End-to-end integration (CPU, quicktest) ──────────────────
 
 
 class TestEndToEnd:

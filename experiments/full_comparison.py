@@ -103,11 +103,15 @@ def evaluate_ppl(model, enc, device):
     mask = enc["attention_mask"].to(device)
     total_loss = 0
     n_batches = 0
+    use_amp = device.type == "cuda"
     with torch.no_grad():
         for i in range(0, ids.size(0), 4):  # batch of 4 for eval
             batch_ids = ids[i:i+4]
             batch_mask = mask[i:i+4]
-            with torch.amp.autocast("cuda", dtype=torch.float16):
+            if use_amp:
+                with torch.amp.autocast("cuda", dtype=torch.float16):
+                    out = model(batch_ids, attention_mask=batch_mask, labels=batch_ids)
+            else:
                 out = model(batch_ids, attention_mask=batch_mask, labels=batch_ids)
             loss_val = out.loss.item()
             if not math.isnan(loss_val) and not math.isinf(loss_val):
@@ -151,7 +155,7 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
 
     t0 = time.perf_counter()
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.float16).to(device)
+        model_name, dtype=torch.float16).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     if n_params > 1e9:
         model.gradient_checkpointing_enable()
@@ -176,9 +180,9 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
 
     # Train each domain
     for i, domain in enumerate(domains):
-        logger.info(f"\n{'─' * 60}")
+        logger.info(f"\n{'-' * 60}")
         logger.info(f"  Domain {i+1}/{len(domains)}: {domain}")
-        logger.info(f"{'─' * 60}")
+        logger.info(f"{'-' * 60}")
 
         domain_result = {
             "domain": domain,
@@ -197,36 +201,58 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
         t0 = time.perf_counter()
         model.train()
 
-        try:
-            import bitsandbytes as bnb
-            optimizer = bnb.optim.Adam8bit(model.parameters(), lr=args.lr)
-            logger.info(f"  Using 8-bit Adam")
-        except ImportError:
+        if device.type == "cuda":
+            try:
+                import bitsandbytes as bnb
+                optimizer = bnb.optim.Adam8bit(model.parameters(), lr=args.lr)
+                logger.info(f"  Using 8-bit Adam")
+            except ImportError:
+                optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        else:
             optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
         ids = train_enc["input_ids"].to(device)
         mask = train_enc["attention_mask"].to(device)
 
         step_losses = []
+        nan_streak = 0
+        training_aborted = False
+        use_amp_train = device.type == "cuda"
         for epoch in range(args.epochs):
             epoch_loss = 0
             n_steps = 0
             for j in range(0, ids.size(0)):
                 optimizer.zero_grad()
-                with torch.amp.autocast("cuda", dtype=torch.float16):
+                if use_amp_train:
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        out = model(ids[j:j+1], attention_mask=mask[j:j+1],
+                                    labels=ids[j:j+1])
+                else:
                     out = model(ids[j:j+1], attention_mask=mask[j:j+1],
                                 labels=ids[j:j+1])
                 out.loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 loss_val = out.loss.item()
-                if not math.isnan(loss_val):
+                if math.isnan(loss_val) or math.isinf(loss_val):
+                    nan_streak += 1
+                    if nan_streak >= 20:
+                        logger.error(f"  ABORT: {nan_streak} consecutive NaN/inf losses")
+                        training_aborted = True
+                        break
+                else:
+                    nan_streak = 0
                     epoch_loss += loss_val
                     n_steps += 1
                 step_losses.append(loss_val)
 
-            avg = epoch_loss / max(n_steps, 1)
-            logger.info(f"  Epoch {epoch+1}/{args.epochs}: loss={avg:.4f}")
+            if n_steps == 0:
+                logger.warning(f"  Epoch {epoch+1}/{args.epochs}: no valid steps (all NaN/inf)")
+            else:
+                avg = epoch_loss / n_steps
+                logger.info(f"  Epoch {epoch+1}/{args.epochs}: loss={avg:.4f}")
+            if training_aborted:
+                break
 
         del optimizer
         torch.cuda.empty_cache()
@@ -236,8 +262,48 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
         domain_result["train"]["step_losses"] = [l for l in step_losses if not math.isnan(l)]
         domain_result["train"]["final_loss"] = step_losses[-1] if step_losses else 0
         domain_result["train"]["n_steps"] = len(step_losses)
+        domain_result["train"]["aborted"] = training_aborted
         logger.info(f"  Training: {train_time:.1f}s, {len(step_losses)} steps")
         logger.info(f"  GPU after train: {gpu_stats()}")
+
+        # Post-training stability check
+        model.eval()
+        post_train_stable = True
+        use_amp_check = device.type == "cuda"
+        with torch.no_grad():
+            for k in range(min(2, ids.size(0))):
+                if use_amp_check:
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        out = model(ids[k:k+1], attention_mask=mask[k:k+1],
+                                    labels=ids[k:k+1])
+                else:
+                    out = model(ids[k:k+1], attention_mask=mask[k:k+1],
+                                labels=ids[k:k+1])
+                if math.isnan(out.loss.item()) or math.isinf(out.loss.item()):
+                    post_train_stable = False
+                    break
+
+        if not post_train_stable or training_aborted:
+            logger.error(f"  MODEL UNSTABLE after training domain '{domain}' — "
+                         f"skipping scoring/repair for this domain")
+            domain_result["conversion"] = {
+                "n_repaired": 0, "n_fixed": 0,
+                "n_candidates": 0, "n_rolled_back": 0,
+                "skipped": True, "reason": "model_unstable_after_training",
+            }
+            # Still evaluate PPL to record the state
+            t0 = time.perf_counter()
+            ppls = {}
+            for name, enc in all_eval_sets:
+                ppl = evaluate_ppl(model, enc, device)
+                ppls[name] = ppl
+            domain_result["timing"]["eval"] = time.perf_counter() - t0
+            domain_result["perplexities"] = ppls
+            domain_result["gm_ppl"] = geometric_mean(list(ppls.values()))
+            domain_result["gpu_memory"] = gpu_stats()
+            results["domains"].append(domain_result)
+            save_json(results, os.path.join(method_dir, "results.json"))
+            continue
 
         # Scoring
         t0 = time.perf_counter()
@@ -272,12 +338,19 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
         test_ids_all = train_enc["input_ids"][:n_test].to(device)
         test_mask_all = train_enc["attention_mask"][:n_test].to(device)
 
+        use_amp = device.type == "cuda"
+
         def check_model_stable():
             """Test model stability on multiple samples."""
             model.eval()
             with torch.no_grad():
                 for k in range(n_test):
-                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                    if use_amp:
+                        with torch.amp.autocast("cuda", dtype=torch.float16):
+                            out = model(test_ids_all[k:k+1],
+                                        attention_mask=test_mask_all[k:k+1],
+                                        labels=test_ids_all[k:k+1])
+                    else:
                         out = model(test_ids_all[k:k+1],
                                     attention_mask=test_mask_all[k:k+1],
                                     labels=test_ids_all[k:k+1])
@@ -406,7 +479,7 @@ def run_lora(model_name, tokenizer, domain_data, all_eval_sets, domains,
     # Load model
     t0 = time.perf_counter()
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.float16).to(device)
+        model_name, dtype=torch.float16).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     if n_params > 1e9:
         model.gradient_checkpointing_enable()
@@ -423,9 +496,9 @@ def run_lora(model_name, tokenizer, domain_data, all_eval_sets, domains,
         target_modules = ["c_attn", "c_proj"]
 
     for i, domain in enumerate(domains):
-        logger.info(f"\n{'─' * 60}")
+        logger.info(f"\n{'-' * 60}")
         logger.info(f"  Domain {i+1}/{len(domains)}: {domain}")
-        logger.info(f"{'─' * 60}")
+        logger.info(f"{'-' * 60}")
 
         domain_result = {
             "domain": domain,
@@ -461,25 +534,44 @@ def run_lora(model_name, tokenizer, domain_data, all_eval_sets, domains,
         mask = train_enc["attention_mask"].to(device)
 
         step_losses = []
+        nan_streak = 0
+        lora_aborted = False
+        use_amp_lora = device.type == "cuda"
         for epoch in range(args.epochs):
             epoch_loss = 0
             n_steps = 0
             for j in range(0, ids.size(0)):
                 optimizer.zero_grad()
-                with torch.amp.autocast("cuda", dtype=torch.float16):
+                if use_amp_lora:
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        out = peft_model(ids[j:j+1], attention_mask=mask[j:j+1],
+                                         labels=ids[j:j+1])
+                else:
                     out = peft_model(ids[j:j+1], attention_mask=mask[j:j+1],
                                      labels=ids[j:j+1])
                 out.loss.backward()
                 torch.nn.utils.clip_grad_norm_(peft_model.parameters(), 1.0)
                 optimizer.step()
                 loss_val = out.loss.item()
-                if not math.isnan(loss_val):
+                if math.isnan(loss_val) or math.isinf(loss_val):
+                    nan_streak += 1
+                    if nan_streak >= 20:
+                        logger.error(f"  ABORT LoRA: {nan_streak} consecutive NaN/inf losses")
+                        lora_aborted = True
+                        break
+                else:
+                    nan_streak = 0
                     epoch_loss += loss_val
                     n_steps += 1
                 step_losses.append(loss_val)
 
-            avg = epoch_loss / max(n_steps, 1)
-            logger.info(f"  Epoch {epoch+1}/{args.epochs}: loss={avg:.4f}")
+            if n_steps == 0:
+                logger.warning(f"  Epoch {epoch+1}/{args.epochs}: no valid steps (all NaN/inf)")
+            else:
+                avg = epoch_loss / n_steps
+                logger.info(f"  Epoch {epoch+1}/{args.epochs}: loss={avg:.4f}")
+            if lora_aborted:
+                break
 
         # Merge adapter
         model = peft_model.merge_and_unload()
@@ -488,9 +580,11 @@ def run_lora(model_name, tokenizer, domain_data, all_eval_sets, domains,
 
         train_time = time.perf_counter() - t0
         domain_result["timing"]["train"] = train_time
-        domain_result["train"]["step_losses"] = step_losses
+        domain_result["train"]["step_losses"] = [l for l in step_losses
+                                                     if not math.isnan(l) and not math.isinf(l)]
         domain_result["train"]["final_loss"] = step_losses[-1] if step_losses else 0
         domain_result["train"]["n_steps"] = len(step_losses)
+        domain_result["train"]["aborted"] = lora_aborted
         logger.info(f"  Training + merge: {train_time:.1f}s")
 
         # Evaluate all domains
@@ -584,8 +678,12 @@ def main():
     logger.info(f"  N-eval:  {args.n_eval}")
     logger.info(f"  Max-len: {args.max_length}")
     logger.info(f"  Output:  {output_dir}")
-    logger.info(f"  GPU:     {torch.cuda.get_device_name(0)}")
-    logger.info(f"  VRAM:    {torch.cuda.get_device_properties(0).total_memory/1e9:.1f}GB")
+    if torch.cuda.is_available():
+        logger.info(f"  GPU:     {torch.cuda.get_device_name(0)}")
+        logger.info(f"  VRAM:    {torch.cuda.get_device_properties(0).total_memory/1e9:.1f}GB")
+    else:
+        logger.info(f"  GPU:     None (CPU mode)")
+        logger.info(f"  VRAM:    N/A")
     logger.info(f"  GC:      threshold={args.gc_threshold}, alpha={args.gc_alpha}, "
                 f"max_repair={args.gc_max_repair_pct*100:.0f}%, "
                 f"batch={args.gc_batch_size}")
@@ -648,36 +746,39 @@ def main():
     logger.info(f"\n  Winner: {winner['method']} (lowest GM perplexity)")
 
     # Full per-domain comparison
-    logger.info(f"\n  Per-domain perplexity after final domain:")
-    all_domains = ["general"] + domains
-    header = f"  {'Method':<12s}" + "".join(f" {d:>10s}" for d in all_domains) + f" {'GM':>10s}"
-    logger.info(header)
-    logger.info("  " + "-" * len(header))
-    for r in [gc_results, lora_results]:
-        ppls = r["domains"][-1]["perplexities"]
-        row = f"  {r['method']:<12s}"
-        for d in all_domains:
-            v = ppls.get(d, float('nan'))
-            row += f" {v:>10.1f}"
-        row += f" {r['final_gm']:>10.1f}"
-        logger.info(row)
+    if gc_results["domains"] and lora_results["domains"]:
+        logger.info(f"\n  Per-domain perplexity after final domain:")
+        all_domains = ["general"] + domains
+        header = f"  {'Method':<12s}" + "".join(f" {d:>10s}" for d in all_domains) + f" {'GM':>10s}"
+        logger.info(header)
+        logger.info("  " + "-" * len(header))
+        for r in [gc_results, lora_results]:
+            ppls = r["domains"][-1]["perplexities"]
+            row = f"  {r['method']:<12s}"
+            for d in all_domains:
+                v = ppls.get(d, float('nan'))
+                row += f" {v:>10.1f}"
+            row += f" {r['final_gm']:>10.1f}"
+            logger.info(row)
 
     # Save combined summary
+    gc_final_ppls = gc_results["domains"][-1]["perplexities"] if gc_results["domains"] else {}
+    lora_final_ppls = lora_results["domains"][-1]["perplexities"] if lora_results["domains"] else {}
     summary = {
         "timestamp": timestamp,
         "model": args.model,
         "domains": domains,
         "gene_conv": {"final_gm": gc_results["final_gm"],
                        "total_time": gc_results["timing"]["total"],
-                       "final_ppls": gc_results["domains"][-1]["perplexities"],
+                       "final_ppls": gc_final_ppls,
                        "config": gc_results["config"]},
         "lora": {"final_gm": lora_results["final_gm"],
                   "total_time": lora_results["timing"]["total"],
-                  "final_ppls": lora_results["domains"][-1]["perplexities"]},
+                  "final_ppls": lora_final_ppls},
         "winner": winner["method"],
         "hardware": {
-            "gpu": torch.cuda.get_device_name(0),
-            "vram_gb": round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1),
+            "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
+            "vram_gb": round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1) if torch.cuda.is_available() else 0,
         },
     }
     save_json(summary, os.path.join(output_dir, "summary.json"))
