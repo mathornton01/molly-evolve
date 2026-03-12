@@ -31,6 +31,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-benchmark"]
 cuda = []  # CUDA extension built automatically when nvcc is available
+compare = ["peft>=0.5", "bitsandbytes", "datasets", "accelerate"]
+all = ["peft>=0.5", "bitsandbytes", "datasets", "accelerate", "sentencepiece"]
+
+[project.scripts]
+molly = "molly_evolution.cli:main"
 
 [tool.setuptools.dynamic]
 version = {attr = "molly_evolution._version.__version__"}
