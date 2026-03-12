@@ -2,20 +2,25 @@
 Transformer-scale Dual Genome Module
 
 Maps GPT-2 (and similar transformer) parameters onto biologically meaningful
-gene boundaries. Each gene corresponds to a functional component:
+gene boundaries. Supports two granularity levels:
 
+Component-level (75 genes for GPT-2):
     - Attention Q/K/V projection (per layer)
     - Attention output projection (per layer)
     - Attention layer norm (per layer)
     - MLP up-projection (per layer)
     - MLP down-projection (per layer)
     - MLP layer norm (per layer)
-    - Token embeddings
-    - Position embeddings
-    - Final layer norm
+    - Token embeddings, Position embeddings, Final layer norm
 
-Gene conversion operates at this component level: repairing or fixing
-entire functional units rather than individual weights.
+Head-level (207 genes for GPT-2):
+    - Individual attention head Q/K/V slices (12 per layer)
+    - Attention output projection (per layer)
+    - Layer norms, MLP up/down (per layer)
+    - Token embeddings, Position embeddings, Final layer norm
+
+Gene conversion operates at the chosen level: repairing or fixing
+functional units rather than individual weights.
 """
 
 import math
@@ -120,6 +125,86 @@ class TransformerGene:
         return sum(t.numel() for t in self.primary.values())
 
 
+class SlicedTransformerGene(TransformerGene):
+    """
+    A gene that operates on slices of parameter tensors rather than full tensors.
+    Used for head-level granularity where c_attn is split across 12 head genes.
+
+    Each slice_def is (param_name, dim, start, end).
+    """
+
+    def __init__(self, name: str, slice_defs: List[Tuple[str, int, int, int]],
+                 n_bits: int = 16):
+        self.name = name
+        self.n_bits = n_bits
+        self.slice_defs = slice_defs
+        self.param_names = list(dict.fromkeys(sd[0] for sd in slice_defs))
+        self.complement: Dict[str, torch.Tensor] = {}
+        self.primary: Dict[str, torch.Tensor] = {}
+        self.scales: Dict[str, float] = {}
+
+    def _key(self, pname, dim, start, end):
+        return f"{pname}::{dim}:{start}:{end}"
+
+    def snapshot_from_model(self, model: nn.Module):
+        params = dict(model.named_parameters())
+        for pname, dim, start, end in self.slice_defs:
+            key = self._key(pname, dim, start, end)
+            sliced = params[pname].data.narrow(dim, start, end - start).contiguous()
+            q, s = self._quantize(sliced)
+            self.complement[key] = q
+            self.primary[key] = q.clone()
+            self.scales[key] = s
+
+    def sync_primary_from_model(self, model: nn.Module):
+        params = dict(model.named_parameters())
+        for pname, dim, start, end in self.slice_defs:
+            key = self._key(pname, dim, start, end)
+            sliced = params[pname].data.narrow(dim, start, end - start).contiguous()
+            q, s = self._quantize(sliced)
+            self.primary[key] = q
+            self.scales[key] = s
+
+    def apply_primary_to_model(self, model: nn.Module):
+        params = dict(model.named_parameters())
+        for pname, dim, start, end in self.slice_defs:
+            key = self._key(pname, dim, start, end)
+            restored = self._dequantize(self.primary[key], self.scales[key])
+            params[pname].data.narrow(dim, start, end - start).copy_(
+                restored.to(params[pname].device)
+            )
+
+    def apply_complement_to_model(self, model: nn.Module):
+        params = dict(model.named_parameters())
+        for pname, dim, start, end in self.slice_defs:
+            key = self._key(pname, dim, start, end)
+            restored = self._dequantize(self.complement[key], self.scales[key])
+            params[pname].data.narrow(dim, start, end - start).copy_(
+                restored.to(params[pname].device)
+            )
+
+    def repair(self):
+        for key in self.complement:
+            self.primary[key] = self.complement[key].clone()
+
+    def fix(self):
+        for key in self.primary:
+            self.complement[key] = self.primary[key].clone()
+
+    def divergence(self) -> float:
+        total_div, total_norm = 0.0, 0.0
+        for key in self.primary:
+            p = self.primary[key].float()
+            c = self.complement[key].float()
+            total_div += (p - c).norm().item() ** 2
+            total_norm += c.norm().item() ** 2
+        return math.sqrt(total_div / total_norm) if total_norm > 0 else 0.0
+
+    @property
+    def n_params(self) -> int:
+        return sum(t.numel() for t in self.primary.values())
+
+
 class TransformerDualGenome:
     """
     Dual-genome wrapper for GPT-2 style transformers.
@@ -130,11 +215,19 @@ class TransformerDualGenome:
     Supports HuggingFace GPT2LMHeadModel out of the box.
     """
 
-    def __init__(self, model: nn.Module, n_bits: int = 16):
+    def __init__(self, model: nn.Module, n_bits: int = 16,
+                 granularity: str = "component"):
+        """
+        granularity: "component" (75 genes) or "head" (207 genes for GPT-2)
+        """
         self.model = model
         self.n_bits = n_bits
+        self.granularity = granularity
         self.genes: List[TransformerGene] = []
-        self._build_gene_map()
+        if granularity == "head":
+            self._build_head_level_map()
+        else:
+            self._build_gene_map()
 
     def _build_gene_map(self):
         """
@@ -196,6 +289,105 @@ class TransformerDualGenome:
                 n_bits=self.n_bits,
             )
             self.genes.append(gene)
+
+    def _build_head_level_map(self):
+        """
+        Head-level gene mapping: split attention QKV into per-head genes.
+        For GPT-2: 12 heads * 12 layers = 144 head genes + 5 * 12 + 3 = 207 total.
+        """
+        all_params = set(dict(self.model.named_parameters()).keys())
+        mapped_params = set()
+        param_list = list(all_params)
+        prefix = self._detect_layer_prefix(param_list)
+
+        # Detect layer indices
+        layer_indices = set()
+        for pname in param_list:
+            parts = pname.split(".")
+            for j, part in enumerate(parts):
+                if part == "h" and j + 1 < len(parts) and parts[j + 1].isdigit():
+                    layer_indices.add(int(parts[j + 1]))
+        layer_indices = sorted(layer_indices)
+
+        # Detect head count and dims from model config or weight shapes
+        n_heads = getattr(getattr(self.model, 'config', None), 'n_head',
+                          getattr(getattr(self.model, 'config', None),
+                                  'num_attention_heads', 12))
+        # Detect hidden_size from c_attn weight
+        params_dict = dict(self.model.named_parameters())
+        for pname in param_list:
+            if "c_attn.weight" in pname:
+                hidden_size = params_dict[pname].shape[0]
+                break
+        else:
+            hidden_size = 768
+        head_dim = hidden_size // n_heads
+
+        for layer_idx in layer_indices:
+            lp = f"{prefix}.{layer_idx}"
+            c_attn_w = f"{lp}.attn.c_attn.weight"
+            c_attn_b = f"{lp}.attn.c_attn.bias"
+
+            # 12 per-head attention genes (SlicedTransformerGene)
+            for h in range(n_heads):
+                qs = h * head_dim
+                ks = hidden_size + h * head_dim
+                vs = 2 * hidden_size + h * head_dim
+                slice_defs = [
+                    (c_attn_w, 1, qs, qs + head_dim),
+                    (c_attn_w, 1, ks, ks + head_dim),
+                    (c_attn_w, 1, vs, vs + head_dim),
+                    (c_attn_b, 0, qs, qs + head_dim),
+                    (c_attn_b, 0, ks, ks + head_dim),
+                    (c_attn_b, 0, vs, vs + head_dim),
+                ]
+                gene = SlicedTransformerGene(
+                    f"L{layer_idx}_head_{h}", slice_defs, self.n_bits
+                )
+                self.genes.append(gene)
+            mapped_params.update([c_attn_w, c_attn_b])
+
+            # Attention output (full param gene)
+            attn_out = sorted(p for p in all_params if f"{lp}.attn.c_proj" in p)
+            if attn_out:
+                self.genes.append(TransformerGene(
+                    f"L{layer_idx}_attn_out", attn_out, self.n_bits))
+                mapped_params.update(attn_out)
+
+            # LN attention
+            ln_attn = sorted(p for p in all_params if f"{lp}.ln_1" in p)
+            if ln_attn:
+                self.genes.append(TransformerGene(
+                    f"L{layer_idx}_ln_attn", ln_attn, self.n_bits))
+                mapped_params.update(ln_attn)
+
+            # MLP up
+            mlp_up = sorted(p for p in all_params if f"{lp}.mlp.c_fc" in p)
+            if mlp_up:
+                self.genes.append(TransformerGene(
+                    f"L{layer_idx}_mlp_up", mlp_up, self.n_bits))
+                mapped_params.update(mlp_up)
+
+            # MLP down
+            mlp_down = sorted(p for p in all_params if f"{lp}.mlp.c_proj" in p)
+            if mlp_down:
+                self.genes.append(TransformerGene(
+                    f"L{layer_idx}_mlp_down", mlp_down, self.n_bits))
+                mapped_params.update(mlp_down)
+
+            # LN MLP
+            ln_mlp = sorted(p for p in all_params if f"{lp}.ln_2" in p)
+            if ln_mlp:
+                self.genes.append(TransformerGene(
+                    f"L{layer_idx}_ln_mlp", ln_mlp, self.n_bits))
+                mapped_params.update(ln_mlp)
+
+        # Non-layer params
+        remaining = all_params - mapped_params
+        non_layer_groups = self._group_non_layer_params(sorted(remaining))
+        for group_name, group_params in non_layer_groups.items():
+            self.genes.append(TransformerGene(
+                group_name, group_params, self.n_bits))
 
     def _detect_layer_prefix(self, param_list: list) -> str:
         """Detect the prefix path to transformer layers."""
