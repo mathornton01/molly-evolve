@@ -16,7 +16,7 @@ DOMAIN_CONFIGS = {
         "config": "wikitext-103-raw-v1",
         "split": "train",
         "text_field": "text",
-        "max_samples": 500,
+        "max_samples": 5000,
         "description": "General English text (WikiText-103)",
     },
     "code": {
@@ -24,7 +24,7 @@ DOMAIN_CONFIGS = {
         "config": None,
         "split": "train",
         "text_field": "output",
-        "max_samples": 500,
+        "max_samples": 5000,
         "description": "Source code (CodeAlpaca)",
     },
     "legal": {
@@ -40,7 +40,7 @@ DOMAIN_CONFIGS = {
         "config": None,
         "split": "train",
         "text_field": "input",
-        "max_samples": 500,
+        "max_samples": 2000,
         "description": "Medical Q&A",
     },
     "science": {

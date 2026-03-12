@@ -243,10 +243,10 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
         score_time = time.perf_counter() - t0
         domain_result["timing"]["score"] = score_time
         domain_result["scoring"]["n_objectives"] = len(prev_evals) + 1
-        # Save gene scores for analysis
+        # Save gene scores for analysis (scores is a list of dicts)
         domain_result["scoring"]["gene_scores"] = {
-            "p_del_max": scores["p_del_prev"].tolist() if hasattr(scores.get("p_del_prev", None), "tolist") else [],
-            "p_ben": scores["p_ben_curr"].tolist() if hasattr(scores.get("p_ben_curr", None), "tolist") else [],
+            "p_del_max": [s["p_del_prev"] for s in scores],
+            "p_ben": [s["p_ben_curr"] for s in scores],
         }
         logger.info(f"  Scoring: {score_time:.1f}s")
 
