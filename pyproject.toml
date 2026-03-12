@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "torch>=2.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "molly-evolution"
+dynamic = ["version"]
+description = "Bayesian genetic algorithm for LLM self-evolution inspired by Amazon Molly fish gene conversion"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "matho"},
+]
+keywords = ["llm", "continual-learning", "genetic-algorithm", "transformers"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.21",
+    "scipy>=1.7",
+    "transformers>=4.20",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-benchmark"]
+cuda = []  # CUDA extension built automatically when nvcc is available
+
+[tool.setuptools.dynamic]
+version = {attr = "molly_evolution._version.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
