@@ -46,7 +46,8 @@ class TransformerGene:
         # These get populated by snapshot/sync
         self.complement: Dict[str, torch.Tensor] = {}  # known-good reference
         self.primary: Dict[str, torch.Tensor] = {}     # current (possibly mutated)
-        self.scales: Dict[str, float] = {}
+        self.scales: Dict[str, float] = {}              # primary scales (updated by sync)
+        self.complement_scales: Dict[str, float] = {}   # complement scales (set at snapshot)
 
     def _quantize(self, tensor: torch.Tensor) -> Tuple[torch.Tensor, float]:
         """Symmetric quantization to n-bit integer."""
@@ -70,6 +71,7 @@ class TransformerGene:
             self.complement[pname] = q
             self.primary[pname] = q.clone()
             self.scales[pname] = s
+            self.complement_scales[pname] = s
 
     def sync_primary_from_model(self, model: nn.Module):
         """Update primary strand from current model weights."""
@@ -94,18 +96,20 @@ class TransformerGene:
         for pname in self.param_names:
             p = params[pname]
             params[pname].data = self._dequantize(
-                self.complement[pname], self.scales[pname]
+                self.complement[pname], self.complement_scales[pname]
             ).to(dtype=p.dtype, device=p.device)
 
     def repair(self):
         """Purifying selection: copy complement -> primary."""
         for pname in self.param_names:
             self.primary[pname] = self.complement[pname].clone()
+            self.scales[pname] = self.complement_scales[pname]
 
     def fix(self):
         """Adaptive selection: copy primary -> complement."""
         for pname in self.param_names:
             self.complement[pname] = self.primary[pname].clone()
+            self.complement_scales[pname] = self.scales[pname]
 
     def divergence(self) -> float:
         """Relative L2 divergence between primary and complement."""
@@ -142,7 +146,8 @@ class SlicedTransformerGene(TransformerGene):
         self.param_names = list(dict.fromkeys(sd[0] for sd in slice_defs))
         self.complement: Dict[str, torch.Tensor] = {}
         self.primary: Dict[str, torch.Tensor] = {}
-        self.scales: Dict[str, float] = {}
+        self.scales: Dict[str, float] = {}              # primary scales
+        self.complement_scales: Dict[str, float] = {}   # complement scales
 
     def _key(self, pname, dim, start, end):
         return f"{pname}::{dim}:{start}:{end}"
@@ -156,6 +161,7 @@ class SlicedTransformerGene(TransformerGene):
             self.complement[key] = q
             self.primary[key] = q.clone()
             self.scales[key] = s
+            self.complement_scales[key] = s
 
     def sync_primary_from_model(self, model: nn.Module):
         params = dict(model.named_parameters())
@@ -181,7 +187,7 @@ class SlicedTransformerGene(TransformerGene):
         for pname, dim, start, end in self.slice_defs:
             key = self._key(pname, dim, start, end)
             p = params[pname]
-            restored = self._dequantize(self.complement[key], self.scales[key])
+            restored = self._dequantize(self.complement[key], self.complement_scales[key])
             p.data.narrow(dim, start, end - start).copy_(
                 restored.to(dtype=p.dtype, device=p.device)
             )
@@ -189,10 +195,12 @@ class SlicedTransformerGene(TransformerGene):
     def repair(self):
         for key in self.complement:
             self.primary[key] = self.complement[key].clone()
+            self.scales[key] = self.complement_scales[key]
 
     def fix(self):
         for key in self.primary:
             self.complement[key] = self.primary[key].clone()
+            self.complement_scales[key] = self.scales[key]
 
     def divergence(self) -> float:
         total_div, total_norm = 0.0, 0.0

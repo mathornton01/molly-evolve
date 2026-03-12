@@ -575,6 +575,8 @@ def run_lora(model_name, tokenizer, domain_data, all_eval_sets, domains,
 
         # Merge adapter
         model = peft_model.merge_and_unload()
+        if n_params > 1e9:
+            model.gradient_checkpointing_enable()
         del optimizer, peft_model
         torch.cuda.empty_cache()
 

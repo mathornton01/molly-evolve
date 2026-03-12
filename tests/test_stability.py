@@ -715,6 +715,59 @@ class TestEmpiricalBayes:
             assert 0 <= s["p_ben_curr"] <= 1, f"p_ben out of range: {s['p_ben_curr']}"
 
 
+    def test_complement_scales_independent_of_primary(self):
+        """After sync_primary, complement should dequantize with its original scale."""
+        from molly_evolution.genome import DualGenome
+
+        model = make_tiny_model()
+        genome = DualGenome(model, granularity="component", backend="python")
+        genome.snapshot()
+
+        # Record original complement values for all genes
+        original_comp_vals = {}
+        for i, gene in enumerate(genome._genome.genes):
+            if hasattr(gene, 'slice_defs'):
+                for pname, dim, start, end in gene.slice_defs:
+                    key = gene._key(pname, dim, start, end)
+                    original_comp_vals[(i, key)] = gene._dequantize(
+                        gene.complement[key], gene.complement_scales[key]).clone()
+            else:
+                for pn in gene.param_names:
+                    original_comp_vals[(i, pn)] = gene._dequantize(
+                        gene.complement[pn], gene.complement_scales[pn]).clone()
+
+        # Perturb model significantly: add large offset to change scales
+        with torch.no_grad():
+            for p in model.parameters():
+                p.add_(torch.randn_like(p) * 10.0)
+        genome.sync_primary()
+
+        # Complement dequantization should still produce original values
+        for i, gene in enumerate(genome._genome.genes):
+            if hasattr(gene, 'slice_defs'):
+                for pname, dim, start, end in gene.slice_defs:
+                    key = gene._key(pname, dim, start, end)
+                    after = gene._dequantize(
+                        gene.complement[key], gene.complement_scales[key])
+                    assert torch.allclose(original_comp_vals[(i, key)], after, atol=1e-6), \
+                        f"Gene {i} key {key}: complement corrupted by sync_primary"
+            else:
+                for pn in gene.param_names:
+                    after = gene._dequantize(
+                        gene.complement[pn], gene.complement_scales[pn])
+                    assert torch.allclose(original_comp_vals[(i, pn)], after, atol=1e-6), \
+                        f"Gene {i} param {pn}: complement corrupted by sync_primary"
+
+        # At least some primary scales should differ from complement scales
+        scale_diffs = 0
+        for gene in genome._genome.genes:
+            for key in gene.scales:
+                if key in gene.complement_scales and gene.scales[key] != gene.complement_scales[key]:
+                    scale_diffs += 1
+        assert scale_diffs > 0, \
+            "After large perturbation, at least some scales should differ"
+
+
 # ── 9. End-to-end integration (CPU, quicktest) ──────────────────
 
 

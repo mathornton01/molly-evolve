@@ -34,7 +34,7 @@ echo ""
 
 # 1. Install dependencies
 echo ">>> Installing dependencies..."
-pip install -q torch transformers datasets peft bitsandbytes scipy accelerate huggingface_hub sentencepiece 2>&1 | tail -5
+pip install -q torch transformers datasets peft bitsandbytes scipy accelerate huggingface_hub sentencepiece pytest 2>&1 | tail -5
 echo "  Done."
 
 # 2. Clone or update repo
@@ -48,8 +48,8 @@ else
     cd "$WORK_DIR"
 fi
 
-# Install the package
-pip install -e . 2>&1 | tail -3
+# Install the package (skip C++ extension build — pure Python is sufficient)
+MOLLY_NO_EXTENSIONS=1 pip install -e . 2>&1 | tail -3
 
 # 3. Quick sanity check
 echo ""

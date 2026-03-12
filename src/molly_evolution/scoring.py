@@ -102,7 +102,7 @@ class GeneScorer:
                 for pname, dim, start, end in gene.slice_defs:
                     key = gene._key(pname, dim, start, end)
                     comp = gene._dequantize(gene.complement[key],
-                                            gene.scales[key]).cpu()
+                                            gene.complement_scales[key]).cpu()
                     prim = gene._dequantize(gene.primary[key],
                                             gene.scales[key]).cpu()
                     delta = (comp - prim).float().to(self.device)
@@ -111,7 +111,7 @@ class GeneScorer:
             else:
                 for pn in gene.param_names:
                     comp = gene._dequantize(gene.complement[pn],
-                                            gene.scales[pn]).cpu()
+                                            gene.complement_scales[pn]).cpu()
                     prim = gene._dequantize(gene.primary[pn],
                                             gene.scales[pn]).cpu()
                     delta = (comp - prim).float().to(self.device)
@@ -257,7 +257,7 @@ class GeneScorer:
 
             for gid, dim, start, end, comp_key, gene in entries:
                 comp = gene._dequantize(gene.complement[comp_key],
-                                        gene.scales[comp_key])
+                                        gene.complement_scales[comp_key])
                 prim = gene._dequantize(gene.primary[comp_key],
                                         gene.scales[comp_key])
                 delta = (comp - prim).float().to(self.device)
