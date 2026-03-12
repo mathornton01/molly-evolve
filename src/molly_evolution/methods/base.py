@@ -69,15 +69,27 @@ class ContinualLearner(ABC):
                 out = self.model(ids, attention_mask=mask, labels=ids)
         return math.exp(min(out.loss.item(), 20))  # cap at exp(20) to avoid overflow
 
+    def _model_is_fp16(self):
+        """Check if model parameters are already in fp16."""
+        for p in self.model.parameters():
+            return p.dtype in (torch.float16, torch.bfloat16)
+        return False
+
     def train_step(self, ids, mask, optimizer, scaler=None):
         """Single training step with optional AMP."""
         optimizer.zero_grad()
-        if self.device.type == "cuda" and scaler is not None:
+        if self.device.type == "cuda" and scaler is not None and not self._model_is_fp16():
             with autocast("cuda", dtype=torch.float16):
                 out = self.model(ids, attention_mask=mask, labels=ids)
             scaler.scale(out.loss).backward()
             scaler.step(optimizer)
             scaler.update()
+        elif self.device.type == "cuda" and self._model_is_fp16():
+            # Model already fp16 — use autocast but no scaler
+            with autocast("cuda", dtype=torch.float16):
+                out = self.model(ids, attention_mask=mask, labels=ids)
+            out.loss.backward()
+            optimizer.step()
         else:
             out = self.model(ids, attention_mask=mask, labels=ids)
             out.loss.backward()

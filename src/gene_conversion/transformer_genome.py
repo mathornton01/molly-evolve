@@ -241,12 +241,13 @@ class TransformerDualGenome:
         param_list = list(all_params)
 
         # Find transformer layers by looking for repeated patterns
-        # GPT-2 HF: transformer.h.{i}.attn.c_attn.weight, etc.
+        # GPT-2 HF: transformer.h.{i}.attn.c_attn.weight
+        # LLaMA HF: model.layers.{i}.self_attn.q_proj.weight
         layer_indices = set()
         for pname in param_list:
             parts = pname.split(".")
             for j, part in enumerate(parts):
-                if part == "h" and j + 1 < len(parts) and parts[j + 1].isdigit():
+                if part in ("h", "layers", "layer") and j + 1 < len(parts) and parts[j + 1].isdigit():
                     layer_indices.add(int(parts[j + 1]))
 
         layer_indices = sorted(layer_indices)
@@ -305,78 +306,136 @@ class TransformerDualGenome:
         for pname in param_list:
             parts = pname.split(".")
             for j, part in enumerate(parts):
-                if part == "h" and j + 1 < len(parts) and parts[j + 1].isdigit():
+                if part in ("h", "layers", "layer") and j + 1 < len(parts) and parts[j + 1].isdigit():
                     layer_indices.add(int(parts[j + 1]))
         layer_indices = sorted(layer_indices)
 
-        # Detect head count and dims from model config or weight shapes
-        n_heads = getattr(getattr(self.model, 'config', None), 'n_head',
-                          getattr(getattr(self.model, 'config', None),
-                                  'num_attention_heads', 12))
-        # Detect hidden_size from c_attn weight
-        params_dict = dict(self.model.named_parameters())
-        for pname in param_list:
-            if "c_attn.weight" in pname:
-                hidden_size = params_dict[pname].shape[0]
-                break
-        else:
-            hidden_size = 768
+        # Detect head count and dims from model config
+        config = getattr(self.model, 'config', None)
+        n_heads = getattr(config, 'n_head',
+                          getattr(config, 'num_attention_heads', 12))
+        hidden_size = getattr(config, 'hidden_size',
+                              getattr(config, 'n_embd', 768))
         head_dim = hidden_size // n_heads
+
+        # Detect architecture style: GPT-2 (fused c_attn) vs LLaMA (separate q/k/v_proj)
+        has_fused_attn = any("c_attn.weight" in p for p in param_list)
+        has_separate_qkv = any("q_proj.weight" in p for p in param_list)
+
+        params_dict = dict(self.model.named_parameters())
 
         for layer_idx in layer_indices:
             lp = f"{prefix}.{layer_idx}"
-            c_attn_w = f"{lp}.attn.c_attn.weight"
-            c_attn_b = f"{lp}.attn.c_attn.bias"
 
-            # 12 per-head attention genes (SlicedTransformerGene)
-            for h in range(n_heads):
-                qs = h * head_dim
-                ks = hidden_size + h * head_dim
-                vs = 2 * hidden_size + h * head_dim
-                slice_defs = [
-                    (c_attn_w, 1, qs, qs + head_dim),
-                    (c_attn_w, 1, ks, ks + head_dim),
-                    (c_attn_w, 1, vs, vs + head_dim),
-                    (c_attn_b, 0, qs, qs + head_dim),
-                    (c_attn_b, 0, ks, ks + head_dim),
-                    (c_attn_b, 0, vs, vs + head_dim),
-                ]
-                gene = SlicedTransformerGene(
-                    f"L{layer_idx}_head_{h}", slice_defs, self.n_bits
-                )
-                self.genes.append(gene)
-            mapped_params.update([c_attn_w, c_attn_b])
+            if has_fused_attn:
+                # GPT-2 style: fused c_attn, split into per-head slices
+                c_attn_w = f"{lp}.attn.c_attn.weight"
+                c_attn_b = f"{lp}.attn.c_attn.bias"
 
-            # Attention output (full param gene)
-            attn_out = sorted(p for p in all_params if f"{lp}.attn.c_proj" in p)
-            if attn_out:
-                self.genes.append(TransformerGene(
-                    f"L{layer_idx}_attn_out", attn_out, self.n_bits))
-                mapped_params.update(attn_out)
+                for h in range(n_heads):
+                    qs = h * head_dim
+                    ks = hidden_size + h * head_dim
+                    vs = 2 * hidden_size + h * head_dim
+                    slice_defs = [
+                        (c_attn_w, 1, qs, qs + head_dim),
+                        (c_attn_w, 1, ks, ks + head_dim),
+                        (c_attn_w, 1, vs, vs + head_dim),
+                        (c_attn_b, 0, qs, qs + head_dim),
+                        (c_attn_b, 0, ks, ks + head_dim),
+                        (c_attn_b, 0, vs, vs + head_dim),
+                    ]
+                    gene = SlicedTransformerGene(
+                        f"L{layer_idx}_head_{h}", slice_defs, self.n_bits
+                    )
+                    self.genes.append(gene)
+                mapped_params.update([c_attn_w, c_attn_b])
+
+                # Attention output
+                attn_out = sorted(p for p in all_params if f"{lp}.attn.c_proj" in p)
+                if attn_out:
+                    self.genes.append(TransformerGene(
+                        f"L{layer_idx}_attn_out", attn_out, self.n_bits))
+                    mapped_params.update(attn_out)
+
+            elif has_separate_qkv:
+                # LLaMA style: separate q/k/v_proj, slice each per head
+                q_proj_w = f"{lp}.self_attn.q_proj.weight"
+                k_proj_w = f"{lp}.self_attn.k_proj.weight"
+                v_proj_w = f"{lp}.self_attn.v_proj.weight"
+                o_proj_w = f"{lp}.self_attn.o_proj.weight"
+
+                # Handle GQA: k/v may have fewer heads
+                n_kv_heads = getattr(config, 'num_key_value_heads', n_heads)
+                kv_head_dim = hidden_size // n_heads  # head_dim stays the same
+
+                for h in range(n_heads):
+                    slice_defs = [
+                        (q_proj_w, 0, h * head_dim, (h + 1) * head_dim),
+                    ]
+                    # For GQA, map multiple query heads to the same kv head
+                    kv_h = h * n_kv_heads // n_heads
+                    if k_proj_w in params_dict:
+                        slice_defs.append(
+                            (k_proj_w, 0, kv_h * head_dim, (kv_h + 1) * head_dim))
+                    if v_proj_w in params_dict:
+                        slice_defs.append(
+                            (v_proj_w, 0, kv_h * head_dim, (kv_h + 1) * head_dim))
+                    # o_proj: slice columns per head
+                    if o_proj_w in params_dict:
+                        slice_defs.append(
+                            (o_proj_w, 1, h * head_dim, (h + 1) * head_dim))
+
+                    gene = SlicedTransformerGene(
+                        f"L{layer_idx}_head_{h}", slice_defs, self.n_bits
+                    )
+                    self.genes.append(gene)
+                mapped_params.update(
+                    p for p in [q_proj_w, k_proj_w, v_proj_w, o_proj_w]
+                    if p in params_dict)
 
             # LN attention
-            ln_attn = sorted(p for p in all_params if f"{lp}.ln_1" in p)
+            ln_attn = sorted(p for p in all_params
+                             if f"{lp}." in p and
+                             ("ln_1" in p or "input_layernorm" in p)
+                             and p not in mapped_params)
             if ln_attn:
                 self.genes.append(TransformerGene(
                     f"L{layer_idx}_ln_attn", ln_attn, self.n_bits))
                 mapped_params.update(ln_attn)
 
-            # MLP up
-            mlp_up = sorted(p for p in all_params if f"{lp}.mlp.c_fc" in p)
+            # MLP components
+            mlp_gate = sorted(p for p in all_params
+                              if f"{lp}." in p and "gate_proj" in p
+                              and p not in mapped_params)
+            if mlp_gate:
+                self.genes.append(TransformerGene(
+                    f"L{layer_idx}_mlp_gate", mlp_gate, self.n_bits))
+                mapped_params.update(mlp_gate)
+
+            mlp_up = sorted(p for p in all_params
+                            if f"{lp}." in p and
+                            ("c_fc" in p or "up_proj" in p)
+                            and p not in mapped_params)
             if mlp_up:
                 self.genes.append(TransformerGene(
                     f"L{layer_idx}_mlp_up", mlp_up, self.n_bits))
                 mapped_params.update(mlp_up)
 
-            # MLP down
-            mlp_down = sorted(p for p in all_params if f"{lp}.mlp.c_proj" in p)
+            mlp_down = sorted(p for p in all_params
+                              if f"{lp}." in p and
+                              ("c_proj" in p or "down_proj" in p)
+                              and "attn" not in p
+                              and p not in mapped_params)
             if mlp_down:
                 self.genes.append(TransformerGene(
                     f"L{layer_idx}_mlp_down", mlp_down, self.n_bits))
                 mapped_params.update(mlp_down)
 
             # LN MLP
-            ln_mlp = sorted(p for p in all_params if f"{lp}.ln_2" in p)
+            ln_mlp = sorted(p for p in all_params
+                            if f"{lp}." in p and
+                            ("ln_2" in p or "post_attention_layernorm" in p)
+                            and p not in mapped_params)
             if ln_mlp:
                 self.genes.append(TransformerGene(
                     f"L{layer_idx}_ln_mlp", ln_mlp, self.n_bits))
