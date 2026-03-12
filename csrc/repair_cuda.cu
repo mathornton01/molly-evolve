@@ -156,7 +156,7 @@ void repair_gene_cuda(
         }
     }
 
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    AT_CUDA_CHECK(cudaGetLastError());
 }
 
 }  // namespace molly

@@ -76,7 +76,7 @@ std::tuple<torch::Tensor, float> quantize_tensor_cuda(
         qmax,
         n);
 
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    AT_CUDA_CHECK(cudaGetLastError());
 
     // Reshape to match input
     output = output.reshape(tensor.sizes());
@@ -102,7 +102,7 @@ torch::Tensor dequantize_tensor_cuda(
         scale,
         n);
 
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    AT_CUDA_CHECK(cudaGetLastError());
 
     return output.reshape(quantized.sizes());
 }

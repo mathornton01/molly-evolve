@@ -99,7 +99,7 @@ torch::Tensor batched_gene_score_cuda(
         n_genes);
 
     // Check for launch errors
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    AT_CUDA_CHECK(cudaGetLastError());
 
     return scores;
 }
