@@ -13,33 +13,34 @@ logger = logging.getLogger("molly_evolution")
 DOMAIN_CONFIGS = {
     "general": {
         "dataset": "wikitext",
-        "config": "wikitext-2-raw-v1",
+        "config": "wikitext-103-raw-v1",
         "split": "train",
         "text_field": "text",
-        "description": "General English text (WikiText-2)",
+        "max_samples": 500,
+        "description": "General English text (WikiText-103)",
     },
     "code": {
         "dataset": "sahil2801/CodeAlpaca-20k",
         "config": None,
         "split": "train",
         "text_field": "output",
-        "max_samples": 200,
+        "max_samples": 500,
         "description": "Source code (CodeAlpaca)",
     },
     "legal": {
-        "dataset": "nguha/legalbench",
-        "config": "contract_nli_explicit_identification",
-        "split": "test",
+        "dataset": "joelito/eurlex",
+        "config": None,
+        "split": "train",
         "text_field": "text",
-        "max_samples": 200,
-        "description": "Legal text",
+        "max_samples": 500,
+        "description": "EU legal text (EurLex)",
     },
     "medical": {
         "dataset": "medalpaca/medical_meadow_medqa",
         "config": None,
         "split": "train",
         "text_field": "input",
-        "max_samples": 200,
+        "max_samples": 500,
         "description": "Medical Q&A",
     },
     "science": {
@@ -47,7 +48,7 @@ DOMAIN_CONFIGS = {
         "config": "arxiv",
         "split": "train",
         "text_field": "article",
-        "max_samples": 200,
+        "max_samples": 500,
         "description": "Scientific papers (arXiv)",
     },
     "finance": {
@@ -55,7 +56,7 @@ DOMAIN_CONFIGS = {
         "config": "sentences_allagree",
         "split": "train",
         "text_field": "sentence",
-        "max_samples": 200,
+        "max_samples": 500,
         "description": "Financial sentiment text",
     },
 }
@@ -173,7 +174,12 @@ def _load_hf_domain(domain, tokenizer, max_length, n_train, n_eval):
         ds_args.append(cfg["config"])
 
     max_samples = cfg.get("max_samples", n_train + n_eval + 50)
-    ds = load_dataset(*ds_args, split=f"{cfg['split']}[:{max_samples}]")
+    try:
+        ds = load_dataset(*ds_args, split=f"{cfg['split']}[:{max_samples}]")
+    except Exception as e:
+        logger.warning(f"  Failed to load '{domain}': {e}")
+        logger.warning(f"  Falling back to quicktest data")
+        return _load_quicktest(domain, tokenizer, max_length, n_train, n_eval)
 
     # Extract text
     text_field = cfg["text_field"]
