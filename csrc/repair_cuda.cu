@@ -156,7 +156,8 @@ void repair_gene_cuda(
         }
     }
 
-    AT_CUDA_CHECK(cudaGetLastError());
+    cudaError_t err = cudaGetLastError();
+    TORCH_CHECK(err == cudaSuccess, "CUDA kernel error: ", cudaGetErrorString(err));
 }
 
 }  // namespace molly
