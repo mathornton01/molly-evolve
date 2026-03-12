@@ -155,7 +155,7 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
 
     t0 = time.perf_counter()
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=torch.float16).to(device)
+        model_name, torch_dtype=torch.float16).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     if n_params > 1e9:
         model.gradient_checkpointing_enable()
@@ -479,7 +479,7 @@ def run_lora(model_name, tokenizer, domain_data, all_eval_sets, domains,
     # Load model
     t0 = time.perf_counter()
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, dtype=torch.float16).to(device)
+        model_name, torch_dtype=torch.float16).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     if n_params > 1e9:
         model.gradient_checkpointing_enable()

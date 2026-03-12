@@ -16,6 +16,14 @@ RESULTS_DIR="/workspace/results"
 MODEL="meta-llama/Llama-2-7b-hf"
 HF_TOKEN="${HF_TOKEN:-}"
 
+# Early validation
+if [ -z "$HF_TOKEN" ]; then
+    echo "ERROR: HF_TOKEN environment variable not set."
+    echo "  LLaMA-2 is a gated model — set your HuggingFace token:"
+    echo "  export HF_TOKEN=hf_..."
+    exit 1
+fi
+
 echo "============================================"
 echo "  Molly-Evolve RunPod Setup"
 echo "============================================"
@@ -26,7 +34,7 @@ echo ""
 
 # 1. Install dependencies
 echo ">>> Installing dependencies..."
-pip install -q torch transformers datasets peft bitsandbytes scipy accelerate huggingface_hub 2>&1 | tail -5
+pip install -q torch transformers datasets peft bitsandbytes scipy accelerate huggingface_hub sentencepiece 2>&1 | tail -5
 echo "  Done."
 
 # 2. Clone or update repo
