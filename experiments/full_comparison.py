@@ -135,7 +135,9 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
         "model": model_name,
         "config": {"epochs": args.epochs, "lr": args.lr, "max_length": args.max_length,
                     "n_train": args.n_train, "n_eval": args.n_eval,
-                    "threshold": 0.50, "alpha": 0.3},
+                    "threshold": args.gc_threshold, "alpha": args.gc_alpha,
+                    "max_repair_pct": args.gc_max_repair_pct,
+                    "repair_batch_size": args.gc_batch_size},
         "domains": [],
         "timing": {},
         "gpu_memory": {},
@@ -245,7 +247,8 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
             prev_evals = [all_eval_sets[0]]
 
         scores = scorer.score_multi_objective(
-            prev_evals, eval_enc, threshold=0.50, alpha=0.3)
+            prev_evals, eval_enc, threshold=args.gc_threshold,
+            alpha=args.gc_alpha)
 
         score_time = time.perf_counter() - t0
         domain_result["timing"]["score"] = score_time
@@ -257,29 +260,65 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
         }
         logger.info(f"  Scoring: {score_time:.1f}s")
 
-        # Conversion with NaN stability check
+        # Gradual batched conversion with NaN stability checks
         t0 = time.perf_counter()
 
-        # Save model state before conversion for rollback
-        state_backup = copy.deepcopy(model.state_dict())
+        to_repair, to_fix = genome.select_conversion_genes(
+            scores, threshold=args.gc_threshold, alpha=args.gc_alpha,
+            max_repair_pct=args.gc_max_repair_pct)
 
-        n_rep, n_fix = genome.apply_conversion(
-            scores, threshold=0.50, alpha=0.3)
+        # Prepare multi-sample NaN test inputs (use up to 4 diverse samples)
+        n_test = min(4, train_enc["input_ids"].size(0))
+        test_ids_all = train_enc["input_ids"][:n_test].to(device)
+        test_mask_all = train_enc["attention_mask"][:n_test].to(device)
 
-        # Check if model is still stable after repair
-        model.eval()
-        with torch.no_grad():
-            test_ids = train_enc["input_ids"][:1].to(device)
-            test_mask = train_enc["attention_mask"][:1].to(device)
-            with torch.amp.autocast("cuda", dtype=torch.float16):
-                test_out = model(test_ids, attention_mask=test_mask, labels=test_ids)
-            if math.isnan(test_out.loss.item()):
-                logger.warning(f"  NaN after repair! Rolling back {n_rep} gene repairs")
-                model.load_state_dict(state_backup)
-                n_rep = 0
-                n_fix = 0
+        def check_model_stable():
+            """Test model stability on multiple samples."""
+            model.eval()
+            with torch.no_grad():
+                for k in range(n_test):
+                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                        out = model(test_ids_all[k:k+1],
+                                    attention_mask=test_mask_all[k:k+1],
+                                    labels=test_ids_all[k:k+1])
+                    if math.isnan(out.loss.item()) or math.isinf(out.loss.item()):
+                        return False
+            return True
 
-        del state_backup
+        # Apply repairs in small batches with NaN check after each
+        batch_size = args.gc_batch_size
+        n_rep = 0
+        n_rep_rolled_back = 0
+        if to_repair:
+            logger.info(f"  Repairing {len(to_repair)} genes in batches of {batch_size}...")
+            for b_start in range(0, len(to_repair), batch_size):
+                batch = to_repair[b_start:b_start + batch_size]
+                state_backup = copy.deepcopy(model.state_dict())
+                genome.repair_genes(batch)
+
+                if check_model_stable():
+                    n_rep += len(batch)
+                    del state_backup
+                    logger.info(f"    batch {b_start//batch_size + 1}: "
+                                f"repaired {len(batch)} genes OK "
+                                f"(total {n_rep})")
+                else:
+                    model.load_state_dict(state_backup)
+                    del state_backup
+                    n_rep_rolled_back += len(batch)
+                    logger.warning(f"    batch {b_start//batch_size + 1}: "
+                                   f"NaN detected, rolled back {len(batch)} genes")
+                    # Stop further repairs — model is at its stability limit
+                    remaining = len(to_repair) - b_start - len(batch)
+                    if remaining > 0:
+                        logger.warning(f"    stopping early, {remaining} genes skipped")
+                    break
+
+        # Apply fixes (these are low-risk: just updating reference)
+        n_fix = 0
+        if to_fix:
+            genome.fix_genes(to_fix)
+            n_fix = len(to_fix)
 
         genome.snapshot()
         scorer = GeneScorer(genome, model, device, use_amp=True, streaming=True)
@@ -287,7 +326,10 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
         domain_result["timing"]["convert"] = convert_time
         domain_result["conversion"]["n_repaired"] = n_rep
         domain_result["conversion"]["n_fixed"] = n_fix
-        logger.info(f"  Conversion: {n_rep} repaired, {n_fix} fixed, {convert_time:.1f}s")
+        domain_result["conversion"]["n_candidates"] = len(to_repair)
+        domain_result["conversion"]["n_rolled_back"] = n_rep_rolled_back
+        logger.info(f"  Conversion: {n_rep} repaired, {n_fix} fixed, "
+                    f"{n_rep_rolled_back} rolled back, {convert_time:.1f}s")
 
         # Evaluate all domains
         t0 = time.perf_counter()
@@ -508,6 +550,14 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--quicktest", action="store_true",
                         help="Use built-in data (no download)")
+    parser.add_argument("--gc-threshold", type=float, default=0.80,
+                        help="Gene conversion repair threshold (default 0.80)")
+    parser.add_argument("--gc-alpha", type=float, default=0.3,
+                        help="Gene conversion alpha weighting (default 0.3)")
+    parser.add_argument("--gc-max-repair-pct", type=float, default=0.03,
+                        help="Max fraction of genes to repair per domain (default 0.03)")
+    parser.add_argument("--gc-batch-size", type=int, default=5,
+                        help="Genes to repair per batch before NaN check (default 5)")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -536,6 +586,9 @@ def main():
     logger.info(f"  Output:  {output_dir}")
     logger.info(f"  GPU:     {torch.cuda.get_device_name(0)}")
     logger.info(f"  VRAM:    {torch.cuda.get_device_properties(0).total_memory/1e9:.1f}GB")
+    logger.info(f"  GC:      threshold={args.gc_threshold}, alpha={args.gc_alpha}, "
+                f"max_repair={args.gc_max_repair_pct*100:.0f}%, "
+                f"batch={args.gc_batch_size}")
     logger.info("")
 
     # Save experiment config
@@ -616,11 +669,16 @@ def main():
         "domains": domains,
         "gene_conv": {"final_gm": gc_results["final_gm"],
                        "total_time": gc_results["timing"]["total"],
-                       "final_ppls": gc_results["domains"][-1]["perplexities"]},
+                       "final_ppls": gc_results["domains"][-1]["perplexities"],
+                       "config": gc_results["config"]},
         "lora": {"final_gm": lora_results["final_gm"],
                   "total_time": lora_results["timing"]["total"],
                   "final_ppls": lora_results["domains"][-1]["perplexities"]},
         "winner": winner["method"],
+        "hardware": {
+            "gpu": torch.cuda.get_device_name(0),
+            "vram_gb": round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1),
+        },
     }
     save_json(summary, os.path.join(output_dir, "summary.json"))
 

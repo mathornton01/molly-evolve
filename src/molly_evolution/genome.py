@@ -165,24 +165,56 @@ class DualGenome:
 
     # ── Gene conversion decision logic ──────────────────────────
 
-    def apply_conversion(self, scores, threshold=0.50, alpha=0.3):
+    def select_conversion_genes(self, scores, threshold=0.80, alpha=0.3,
+                                max_repair_pct=0.03, max_repair_count=None):
+        """
+        Select genes for repair/fix based on Bayesian scores.
+
+        Returns (to_repair, to_fix) — sorted lists of gene IDs.
+        to_repair is sorted by trade score descending (worst genes first).
+        """
+        candidates = []
+        fixed = []
+        for s in scores:
+            trade = s["p_del_prev"] - alpha * s["p_ben_curr"]
+            if trade > threshold:
+                candidates.append((trade, s["gene_id"]))
+            elif s["p_del_prev"] < 0.3:
+                fixed.append(s["gene_id"])
+
+        # Cap repairs: percentage-based with optional absolute cap
+        max_n = max(int(self.total_genes * max_repair_pct), 1)
+        if max_repair_count is not None:
+            max_n = min(max_n, max_repair_count)
+
+        # Sort by trade score descending, take the most damaging genes first
+        candidates.sort(reverse=True)
+        to_repair = [gid for _, gid in candidates[:max_n]]
+
+        n_skipped = len(candidates) - len(to_repair)
+        if n_skipped > 0:
+            logger.info(f"  repair cap: {len(to_repair)}/{len(candidates)} "
+                        f"candidates selected (max {max_repair_pct*100:.0f}% "
+                        f"= {max_n} genes)")
+
+        return to_repair, fixed
+
+    def apply_conversion(self, scores, threshold=0.80, alpha=0.3,
+                         max_repair_pct=0.03, max_repair_count=None):
         """
         Apply gene conversion based on Bayesian scores.
 
         Returns (n_repaired, n_fixed).
         """
-        repaired, fixed = [], []
-        for s in scores:
-            trade = s["p_del_prev"] - alpha * s["p_ben_curr"]
-            if trade > threshold:
-                repaired.append(s["gene_id"])
-            elif s["p_del_prev"] < 0.3:
-                fixed.append(s["gene_id"])
-        if repaired:
-            self.repair_genes(repaired)
-        if fixed:
-            self.fix_genes(fixed)
-        return len(repaired), len(fixed)
+        to_repair, to_fix = self.select_conversion_genes(
+            scores, threshold=threshold, alpha=alpha,
+            max_repair_pct=max_repair_pct,
+            max_repair_count=max_repair_count)
+        if to_repair:
+            self.repair_genes(to_repair)
+        if to_fix:
+            self.fix_genes(to_fix)
+        return len(to_repair), len(to_fix)
 
     # ── Memory estimation ───────────────────────────────────────
 
