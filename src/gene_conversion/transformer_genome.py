@@ -83,18 +83,19 @@ class TransformerGene:
         """Write primary strand back to model."""
         params = dict(model.named_parameters())
         for pname in self.param_names:
+            p = params[pname]
             params[pname].data = self._dequantize(
                 self.primary[pname], self.scales[pname]
-            ).to(params[pname].device)
+            ).to(dtype=p.dtype, device=p.device)
 
     def apply_complement_to_model(self, model: nn.Module):
         """Write complement strand back to model (full repair)."""
         params = dict(model.named_parameters())
         for pname in self.param_names:
-            # Use complement's own scale (from snapshot time)
+            p = params[pname]
             params[pname].data = self._dequantize(
                 self.complement[pname], self.scales[pname]
-            ).to(params[pname].device)
+            ).to(dtype=p.dtype, device=p.device)
 
     def repair(self):
         """Purifying selection: copy complement -> primary."""
@@ -169,18 +170,20 @@ class SlicedTransformerGene(TransformerGene):
         params = dict(model.named_parameters())
         for pname, dim, start, end in self.slice_defs:
             key = self._key(pname, dim, start, end)
+            p = params[pname]
             restored = self._dequantize(self.primary[key], self.scales[key])
-            params[pname].data.narrow(dim, start, end - start).copy_(
-                restored.to(params[pname].device)
+            p.data.narrow(dim, start, end - start).copy_(
+                restored.to(dtype=p.dtype, device=p.device)
             )
 
     def apply_complement_to_model(self, model: nn.Module):
         params = dict(model.named_parameters())
         for pname, dim, start, end in self.slice_defs:
             key = self._key(pname, dim, start, end)
+            p = params[pname]
             restored = self._dequantize(self.complement[key], self.scales[key])
-            params[pname].data.narrow(dim, start, end - start).copy_(
-                restored.to(params[pname].device)
+            p.data.narrow(dim, start, end - start).copy_(
+                restored.to(dtype=p.dtype, device=p.device)
             )
 
     def repair(self):
