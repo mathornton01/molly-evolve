@@ -19,17 +19,17 @@ DOMAIN_CONFIGS = {
         "description": "General English text (WikiText-2)",
     },
     "code": {
-        "dataset": "bigcode/starcoderdata",
+        "dataset": "sahil2801/CodeAlpaca-20k",
         "config": None,
         "split": "train",
-        "text_field": "content",
+        "text_field": "output",
         "max_samples": 200,
-        "description": "Source code",
+        "description": "Source code (CodeAlpaca)",
     },
     "legal": {
-        "dataset": "pile-of-law/pile-of-law",
-        "config": "r_legaladvice",
-        "split": "train",
+        "dataset": "nguha/legalbench",
+        "config": "contract_nli_explicit_identification",
+        "split": "test",
         "text_field": "text",
         "max_samples": 200,
         "description": "Legal text",
@@ -173,8 +173,7 @@ def _load_hf_domain(domain, tokenizer, max_length, n_train, n_eval):
         ds_args.append(cfg["config"])
 
     max_samples = cfg.get("max_samples", n_train + n_eval + 50)
-    ds = load_dataset(*ds_args, split=f"{cfg['split']}[:{max_samples}]",
-                      trust_remote_code=True)
+    ds = load_dataset(*ds_args, split=f"{cfg['split']}[:{max_samples}]")
 
     # Extract text
     text_field = cfg["text_field"]
