@@ -78,7 +78,6 @@ class GeneConvLearner(ContinualLearner):
         t0 = time.perf_counter()
         self.model.train()
         optimizer = self._make_optimizer(lr)
-        scaler = GradScaler() if self.device.type == "cuda" else None
 
         ids = train_enc["input_ids"].to(self.device)
         mask = train_enc["attention_mask"].to(self.device)
@@ -89,11 +88,11 @@ class GeneConvLearner(ContinualLearner):
             for i in range(0, ids.size(0), batch_size):
                 batch_ids = ids[i:i+batch_size]
                 batch_mask = mask[i:i+batch_size]
-                loss = self.train_step(batch_ids, batch_mask, optimizer, scaler)
+                loss = self.train_step(batch_ids, batch_mask, optimizer)
                 total_loss += loss
                 n_steps += 1
 
-        del optimizer, scaler
+        del optimizer
         dt = time.perf_counter() - t0
         avg_loss = total_loss / max(n_steps, 1)
         logger.info(f"[gene-conv] Train: {n_steps} steps, "
