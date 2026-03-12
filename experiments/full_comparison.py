@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import copy
 import gc
 import json
 import logging
@@ -96,7 +97,7 @@ PARAMETER stop "[INST]"
 
 
 def evaluate_ppl(model, enc, device):
-    """Compute perplexity, handling overflow gracefully."""
+    """Compute perplexity, handling overflow and NaN gracefully."""
     model.eval()
     ids = enc["input_ids"].to(device)
     mask = enc["attention_mask"].to(device)
@@ -108,9 +109,13 @@ def evaluate_ppl(model, enc, device):
             batch_mask = mask[i:i+4]
             with torch.amp.autocast("cuda", dtype=torch.float16):
                 out = model(batch_ids, attention_mask=batch_mask, labels=batch_ids)
-            total_loss += out.loss.item()
-            n_batches += 1
-    avg_loss = total_loss / max(n_batches, 1)
+            loss_val = out.loss.item()
+            if not math.isnan(loss_val) and not math.isinf(loss_val):
+                total_loss += loss_val
+                n_batches += 1
+    if n_batches == 0:
+        return float('inf')
+    avg_loss = total_loss / n_batches
     ppl = math.exp(min(avg_loss, 20))  # cap to avoid overflow
     return ppl
 
@@ -210,10 +215,12 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
                     out = model(ids[j:j+1], attention_mask=mask[j:j+1],
                                 labels=ids[j:j+1])
                 out.loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 loss_val = out.loss.item()
-                epoch_loss += loss_val
-                n_steps += 1
+                if not math.isnan(loss_val):
+                    epoch_loss += loss_val
+                    n_steps += 1
                 step_losses.append(loss_val)
 
             avg = epoch_loss / max(n_steps, 1)
@@ -224,7 +231,7 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
 
         train_time = time.perf_counter() - t0
         domain_result["timing"]["train"] = train_time
-        domain_result["train"]["step_losses"] = step_losses
+        domain_result["train"]["step_losses"] = [l for l in step_losses if not math.isnan(l)]
         domain_result["train"]["final_loss"] = step_losses[-1] if step_losses else 0
         domain_result["train"]["n_steps"] = len(step_losses)
         logger.info(f"  Training: {train_time:.1f}s, {len(step_losses)} steps")
@@ -250,10 +257,30 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
         }
         logger.info(f"  Scoring: {score_time:.1f}s")
 
-        # Conversion
+        # Conversion with NaN stability check
         t0 = time.perf_counter()
+
+        # Save model state before conversion for rollback
+        state_backup = copy.deepcopy(model.state_dict())
+
         n_rep, n_fix = genome.apply_conversion(
             scores, threshold=0.50, alpha=0.3)
+
+        # Check if model is still stable after repair
+        model.eval()
+        with torch.no_grad():
+            test_ids = train_enc["input_ids"][:1].to(device)
+            test_mask = train_enc["attention_mask"][:1].to(device)
+            with torch.amp.autocast("cuda", dtype=torch.float16):
+                test_out = model(test_ids, attention_mask=test_mask, labels=test_ids)
+            if math.isnan(test_out.loss.item()):
+                logger.warning(f"  NaN after repair! Rolling back {n_rep} gene repairs")
+                model.load_state_dict(state_backup)
+                n_rep = 0
+                n_fix = 0
+
+        del state_backup
+
         genome.snapshot()
         scorer = GeneScorer(genome, model, device, use_amp=True, streaming=True)
         convert_time = time.perf_counter() - t0
@@ -401,10 +428,12 @@ def run_lora(model_name, tokenizer, domain_data, all_eval_sets, domains,
                     out = peft_model(ids[j:j+1], attention_mask=mask[j:j+1],
                                      labels=ids[j:j+1])
                 out.loss.backward()
+                torch.nn.utils.clip_grad_norm_(peft_model.parameters(), 1.0)
                 optimizer.step()
                 loss_val = out.loss.item()
-                epoch_loss += loss_val
-                n_steps += 1
+                if not math.isnan(loss_val):
+                    epoch_loss += loss_val
+                    n_steps += 1
                 step_losses.append(loss_val)
 
             avg = epoch_loss / max(n_steps, 1)
