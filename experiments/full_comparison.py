@@ -51,9 +51,9 @@ def gpu_stats():
 
 
 def geometric_mean(values):
-    values = [v for v in values if v > 0 and not math.isnan(v)]
+    values = [v for v in values if v > 0 and not math.isnan(v) and not math.isinf(v)]
     if not values:
-        return float('nan')
+        return float('inf')
     log_sum = sum(math.log(v) for v in values)
     return math.exp(log_sum / len(values))
 

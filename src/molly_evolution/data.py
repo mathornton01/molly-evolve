@@ -110,7 +110,7 @@ QUICKTEST_DATA = {
         "solving specific sub-problems, the creation of new ties between AI and other "
         "fields working on similar problems, and above all, a new commitment by researchers "
         "to solid mathematical methods and rigorous scientific standards. "
-    ) * 100,
+    ) * 200,
     "code": (
         "def fibonacci(n):\n    if n <= 1:\n        return n\n    return fibonacci(n-1) "
         "+ fibonacci(n-2)\n\ndef quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n"
@@ -170,7 +170,7 @@ QUICKTEST_DATA = {
         "                distances[neighbor] = new_dist\n"
         "                heapq.heappush(pq, (new_dist, neighbor))\n"
         "    return distances\n\n"
-    ) * 100,
+    ) * 200,
     "legal": (
         "The defendant is hereby charged with violation of Section 1983 of Title 42 "
         "of the United States Code. The plaintiff alleges that the defendant, acting "
@@ -215,7 +215,7 @@ QUICKTEST_DATA = {
         "made between the parties. The parol evidence rule generally prevents parties from "
         "introducing extrinsic evidence to contradict or vary the terms of a written "
         "agreement that the parties intended as a final expression of their agreement. "
-    ) * 100,
+    ) * 200,
     "medical": (
         "The patient presents with acute myocardial infarction characterized by "
         "ST-segment elevation in leads V1-V4. Troponin I levels are elevated at "
@@ -251,7 +251,7 @@ QUICKTEST_DATA = {
         "frequent exacerbations. Pulmonary rehabilitation improves exercise tolerance "
         "and quality of life. Supplemental oxygen is indicated for severe resting "
         "hypoxemia with PaO2 less than 55 mmHg. "
-    ) * 100,
+    ) * 200,
 }
 
 
