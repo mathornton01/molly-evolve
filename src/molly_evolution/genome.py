@@ -6,6 +6,7 @@ Wraps TransformerDualGenome with automatic backend dispatch:
   - Python: falls back to existing pure-Python implementation
 """
 
+import logging
 import time
 from typing import List, Optional
 
@@ -20,6 +21,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from gene_conversion.transformer_genome import (
     TransformerDualGenome, TransformerGene, SlicedTransformerGene,
 )
+
+logger = logging.getLogger("molly_evolution")
 
 # Try to load C++ extension
 try:
@@ -118,17 +121,23 @@ class DualGenome:
 
     def snapshot(self):
         """Mark current model weights as healthy reference (complement)."""
+        t0 = time.perf_counter()
         if self._use_cuda and _C is not None:
             _C.batch_snapshot(self._genome, self.model)
         else:
             self._genome.snapshot()
+        dt = time.perf_counter() - t0
+        logger.info(f"snapshot: {dt:.3f}s | {self.total_genes} genes")
 
     def sync_primary(self):
         """Update primary strands from current model weights."""
+        t0 = time.perf_counter()
         if self._use_cuda and _C is not None:
             _C.batch_sync(self._genome, self.model)
         else:
             self._genome.sync_primary()
+        dt = time.perf_counter() - t0
+        logger.info(f"sync_primary: {dt:.3f}s | {self.total_genes} genes")
 
     def apply_primary(self):
         """Write primary strands back to model."""
@@ -136,14 +145,20 @@ class DualGenome:
 
     def repair_genes(self, gene_ids: List[int]):
         """Purifying selection: restore specified genes from complement."""
+        t0 = time.perf_counter()
         if self._use_cuda and _C is not None:
             _C.batch_repair(self._genome, self.model, gene_ids)
         else:
             self._genome.repair_genes(gene_ids)
+        dt = time.perf_counter() - t0
+        logger.info(f"repair: {dt:.3f}s | {len(gene_ids)}/{self.total_genes} genes")
 
     def fix_genes(self, gene_ids: List[int]):
         """Adaptive selection: copy primary to complement for specified genes."""
+        t0 = time.perf_counter()
         self._genome.fix_genes(gene_ids)
+        dt = time.perf_counter() - t0
+        logger.info(f"fix: {dt:.3f}s | {len(gene_ids)}/{self.total_genes} genes")
 
     def gene_summary(self):
         return self._genome.gene_summary()
@@ -168,3 +183,20 @@ class DualGenome:
         if fixed:
             self.fix_genes(fixed)
         return len(repaired), len(fixed)
+
+    # ── Memory estimation ───────────────────────────────────────
+
+    def memory_footprint(self) -> dict:
+        """Estimate memory footprint in MB."""
+        n_params = sum(p.numel() for p in self.model.parameters())
+        param_dtype = next(self.model.parameters()).dtype
+        model_bytes = n_params * (2 if param_dtype == torch.float16 else 4)
+        genome_bytes = n_params * 4  # primary + complement (int16 each)
+
+        return {
+            "n_params": n_params,
+            "n_genes": self.total_genes,
+            "model_gpu_mb": model_bytes / 1024 / 1024,
+            "genome_cpu_mb": genome_bytes / 1024 / 1024,
+            "granularity": self.granularity,
+        }

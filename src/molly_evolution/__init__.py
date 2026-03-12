@@ -15,6 +15,11 @@ Usage:
     scorer = GeneScorer(genome, model, device)
     scores = scorer.score_multi_objective(eval_sets, current_eval)
     genome.apply_conversion(scores)
+
+Scaling:
+    from molly_evolution.distributed import (
+        MultiGPUScorer, FSDPGenome, estimate_requirements
+    )
 """
 
 from molly_evolution._version import __version__
