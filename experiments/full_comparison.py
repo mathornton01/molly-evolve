@@ -366,7 +366,7 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
             logger.info(f"  Repairing {len(to_repair)} genes in batches of {batch_size}...")
             for b_start in range(0, len(to_repair), batch_size):
                 batch = to_repair[b_start:b_start + batch_size]
-                state_backup = copy.deepcopy(model.state_dict())
+                state_backup = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 genome.repair_genes(batch)
 
                 if check_model_stable():

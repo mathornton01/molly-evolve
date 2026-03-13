@@ -30,6 +30,11 @@ echo "============================================"
 echo "  $(date)"
 echo "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'N/A')"
 echo "  VRAM: $(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null || echo 'N/A')"
+DISK_FREE_GB=$(df -BG /workspace 2>/dev/null | tail -1 | awk '{print $4}' | tr -d 'G')
+echo "  Disk: ${DISK_FREE_GB:-?}GB free on /workspace"
+if [ -n "$DISK_FREE_GB" ] && [ "$DISK_FREE_GB" -lt 50 ] 2>/dev/null; then
+    echo "  WARNING: <50GB free — saving two 7B models needs ~40GB"
+fi
 echo ""
 
 # 1. Install dependencies
