@@ -42,6 +42,10 @@ echo ">>> Installing dependencies..."
 pip install -q torch transformers datasets peft bitsandbytes scipy accelerate huggingface_hub sentencepiece pytest 2>&1 | tail -5
 echo "  Done."
 
+# Register HF token for gated model access (LLaMA-2)
+echo ">>> Registering HuggingFace token..."
+huggingface-cli login --token "$HF_TOKEN" 2>&1 | tail -1
+
 # 2. Clone or update repo
 if [ -d "$WORK_DIR" ]; then
     echo ">>> Updating existing repo..."
