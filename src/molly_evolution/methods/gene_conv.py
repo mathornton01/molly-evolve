@@ -6,6 +6,7 @@ to identify damaged genes and repair them from the complement strand.
 """
 
 import logging
+import math
 import time
 from typing import Dict, List, Tuple
 
@@ -26,12 +27,16 @@ class GeneConvLearner(ContinualLearner):
 
     def __init__(self, model_name: str, device: torch.device,
                  granularity: str = "head", streaming: bool = True,
-                 threshold: float = 0.50, alpha: float = 0.3, **kwargs):
+                 threshold: float = 0.50, alpha: float = 0.3,
+                 max_repair_pct: float = 0.03, max_grad_norm: float = 1.0,
+                 **kwargs):
         super().__init__(model_name, device, **kwargs)
         self.granularity = granularity
         self.streaming = streaming
         self.threshold = threshold
         self.alpha = alpha
+        self.max_repair_pct = max_repair_pct
+        self.max_grad_norm = max_grad_norm
         self.genome = None
         self.scorer = None
 
@@ -39,8 +44,15 @@ class GeneConvLearner(ContinualLearner):
         from transformers import AutoModelForCausalLM
         logger.info(f"[gene-conv] Loading {self.model_name}...")
         t0 = time.perf_counter()
+        # Use bfloat16 if available (avoids NaN from fp16 overflow), else float32
+        if self.device.type == "cuda" and torch.cuda.is_bf16_supported():
+            dtype = torch.bfloat16
+            logger.info(f"[gene-conv] Using bfloat16 (GPU supports it)")
+        else:
+            dtype = torch.float32
+            logger.info(f"[gene-conv] Using float32 (bf16 not supported)")
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name, torch_dtype=torch.float16).to(self.device)
+            self.model_name, torch_dtype=dtype).to(self.device)
         # Enable gradient checkpointing for large models
         n_params = sum(p.numel() for p in self.model.parameters())
         if n_params > 1e9:
@@ -84,20 +96,36 @@ class GeneConvLearner(ContinualLearner):
 
         total_loss = 0
         n_steps = 0
+        nan_steps = 0
         for epoch in range(epochs):
             for i in range(0, ids.size(0), batch_size):
                 batch_ids = ids[i:i+batch_size]
                 batch_mask = mask[i:i+batch_size]
                 loss = self.train_step(batch_ids, batch_mask, optimizer)
+
+                # Guard against NaN/Inf loss
+                if not math.isfinite(loss):
+                    nan_steps += 1
+                    logger.warning(f"[gene-conv] NaN/Inf loss at step {n_steps}, skipping")
+                    optimizer.zero_grad()
+                    continue
+
+                # Gradient clipping to prevent explosion at large scale
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.max_grad_norm)
+
                 total_loss += loss
                 n_steps += 1
 
         del optimizer
         dt = time.perf_counter() - t0
         avg_loss = total_loss / max(n_steps, 1)
+        if nan_steps > 0:
+            logger.warning(f"[gene-conv] {nan_steps} NaN/Inf steps skipped")
         logger.info(f"[gene-conv] Train: {n_steps} steps, "
                     f"loss={avg_loss:.4f}, {dt:.2f}s")
-        return {"loss": avg_loss, "time": dt, "steps": n_steps}
+        return {"loss": avg_loss, "time": dt, "steps": n_steps,
+                "nan_steps": nan_steps}
 
     def post_train(self, eval_sets: List[Tuple[str, dict]],
                    curr_eval: dict) -> dict:
@@ -106,7 +134,8 @@ class GeneConvLearner(ContinualLearner):
             eval_sets, curr_eval,
             threshold=self.threshold, alpha=self.alpha)
         n_rep, n_fix = self.genome.apply_conversion(
-            scores, threshold=self.threshold, alpha=self.alpha)
+            scores, threshold=self.threshold, alpha=self.alpha,
+            max_repair_pct=self.max_repair_pct)
         self.genome.snapshot()
         dt = time.perf_counter() - t0
         logger.info(f"[gene-conv] Post-train: {n_rep} repaired, "

@@ -255,6 +255,12 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
                 break
 
         del optimizer
+        # Aggressively free training memory before scoring
+        model.zero_grad(set_to_none=True)
+        for p in model.parameters():
+            p.grad = None
+        del ids, mask
+        gc.collect()
         torch.cuda.empty_cache()
 
         train_time = time.perf_counter() - t0
@@ -264,7 +270,11 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
         domain_result["train"]["n_steps"] = len(step_losses)
         domain_result["train"]["aborted"] = training_aborted
         logger.info(f"  Training: {train_time:.1f}s, {len(step_losses)} steps")
-        logger.info(f"  GPU after train: {gpu_stats()}")
+        logger.info(f"  GPU after cleanup: {gpu_stats()}")
+
+        # Reload training data for stability check (small cost, big memory win)
+        ids = train_enc["input_ids"].to(device)
+        mask = train_enc["attention_mask"].to(device)
 
         # Post-training stability check
         model.eval()

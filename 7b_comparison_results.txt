@@ -1,0 +1,162 @@
+  Loading 'general' (quicktest, built-in data)
+    train: 100 x 256 tokens
+    eval:  49 x 256 tokens
+  Loading 'code' (quicktest, built-in data)
+    train: 100 x 256 tokens
+    eval:  49 x 256 tokens
+  Loading 'legal' (quicktest, built-in data)
+    train: 100 x 256 tokens
+    eval:  49 x 256 tokens
+  Loading 'medical' (quicktest, built-in data)
+    train: 100 x 256 tokens
+    eval:  49 x 256 tokens
+[gene-conv] Loading Qwen/Qwen2.5-7B...
+/home/mathornton/micah/molly-evolve/venv/lib/python3.12/site-packages/torch/cuda/__init__.py:435: UserWarning: 
+    Found GPU0 NVIDIA GB10 which is of cuda capability 12.1.
+    Minimum and Maximum cuda capability supported by this version of PyTorch is
+    (8.0) - (12.0)
+    
+  queued_call()
+[gene-conv] Using bfloat16 (GPU supports it)
+`torch_dtype` is deprecated! Use `dtype` instead!
+
+============================================================
+  Molly Evolution — Method Comparison
+============================================================
+  Model:   Qwen/Qwen2.5-7B
+  Methods: gene-conv, lora, qlora
+  Domains: code -> legal -> medical
+  Device:  cuda
+
+Loading data...
+
+============================================================
+  Running: gene-conv
+============================================================
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]Fetching 4 files:  25%|██▌       | 1/4 [04:28<13:25, 268.61s/it]Fetching 4 files: 100%|██████████| 4/4 [04:28<00:00, 67.15s/it] 
+Loading weights:   0%|          | 0/339 [00:00<?, ?it/s]Loading weights: 100%|██████████| 339/339 [00:00<00:00, 5025.28it/s]
+[gene-conv] Gradient checkpointing enabled (7.6B params)
+[gene-conv] Model loaded in 351.4s
+[gene-conv] Genome: 928 genes (head)
+snapshot: 2.846s | 928 genes
+GeneScorer: streaming mode (low memory)
+  build_ref_map: 0.002s | GPU: 46058 MB
+[gene-conv] Snapshot: 2.859s
+[gene-conv] Using 8-bit Adam (model has 7.6B params)
+`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`.
+[gene-conv] Train: 200 steps, loss=0.1665, 473.97s
+    split-half r=0.931
+  scored 'general': 83.689s
+    split-half r=-0.311
+  scored 'current': 80.949s
+    'general' Bayes: B=0.951, SNR=19.49, tau2=3.68e-04, sigma2=1.89e-05
+    'current' Bayes: B=0.000, SNR=0.00
+  total scoring: 165.943s | 928 genes x 2 objectives (Bayesian)
+  repair cap: 27/208 candidates selected (max 3% = 27 genes)
+repair: 0.012s | 27/928 genes
+fix: 0.002s | 19/928 genes
+snapshot: 1.251s | 928 genes
+[gene-conv] Post-train: 27 repaired, 19 fixed, 167.21s
+[gene-conv] Using 8-bit Adam (model has 7.6B params)
+[gene-conv] Train: 200 steps, loss=0.1134, 473.98s
+    split-half r=0.999
+  scored 'general': 82.630s
+    split-half r=0.977
+  scored 'code': 81.513s
+    split-half r=0.750
+  scored 'current': 82.142s
+    'general' Bayes: B=0.999, SNR=1967.40, tau2=1.87e-04, sigma2=9.49e-08
+    'code' Bayes: B=0.988, SNR=79.18, tau2=1.46e-05, sigma2=1.85e-07
+    'current' Bayes: B=0.738, SNR=2.81
+  total scoring: 247.435s | 928 genes x 3 objectives (Bayesian)
+  repair cap: 27/852 candidates selected (max 3% = 27 genes)
+repair: 0.027s | 27/928 genes
+snapshot: 1.474s | 928 genes
+[gene-conv] Post-train: 27 repaired, 0 fixed, 248.94s
+[gene-conv] Using 8-bit Adam (model has 7.6B params)
+[gene-conv] Train: 200 steps, loss=0.2271, 472.25s
+    split-half r=-0.678
+  scored 'general': 81.109s
+    split-half r=0.952
+  scored 'code': 81.278s
+    split-half r=0.586
+  scored 'legal': 80.761s
+    split-half r=0.947
+  scored 'current': 81.052s
+    'general' Bayes: B=0.000, SNR=0.00, tau2=0.00e+00, sigma2=2.70e-02
+    'code' Bayes: B=0.974, SNR=37.07, tau2=1.51e-01, sigma2=4.09e-03
+    'legal' Bayes: B=0.425, SNR=0.74, tau2=1.56e-03, sigma2=2.12e-03
+    'current' Bayes: B=0.890, SNR=8.10
+  total scoring: 325.271s | 928 genes x 4 objectives (Bayesian)
+repair: 0.005s | 9/928 genes
+fix: 0.010s | 62/928 genes
+snapshot: 1.279s | 928 genes
+[gene-conv] Post-train: 9 repaired, 62 fixed, 326.57s
+[lora] Loading Qwen/Qwen2.5-7B...
+
+  Domain 1/3: code
+    PPL: general:5.6 | code:1.1 | legal:2.9 | medical:4.7 | GM: 3.0
+
+  Domain 2/3: legal
+    PPL: general:6.9 | code:1.1 | legal:1.1 | medical:4.7 | GM: 2.5
+
+  Domain 3/3: medical
+    PPL: general:1079014.5 | code:2.2 | legal:555670.1 | medical:130676.4 | GM: 20306.8
+
+============================================================
+  Running: lora
+============================================================
+Loading weights:   0%|          | 0/339 [00:00<?, ?it/s]Loading weights:   0%|          | 1/339 [00:00<01:59,  2.84it/s]Loading weights:  19%|█▉        | 64/339 [00:00<00:01, 179.83it/s]Loading weights:  29%|██▉       | 100/339 [00:00<00:01, 214.99it/s]Loading weights:  40%|████      | 136/339 [00:00<00:00, 238.23it/s]Loading weights:  51%|█████     | 172/339 [00:00<00:00, 242.68it/s]Loading weights:  61%|██████▏   | 208/339 [00:00<00:00, 255.94it/s]Loading weights:  72%|███████▏  | 244/339 [00:01<00:00, 259.95it/s]Loading weights:  83%|████████▎ | 280/339 [00:01<00:00, 263.88it/s]Loading weights:  91%|█████████ | 308/339 [00:01<00:00, 265.16it/s]Loading weights: 100%|██████████| 339/339 [00:01<00:00, 237.51it/s]
+[lora] Model loaded in 4.6s
+[lora] Trainable: 2,523,136 / 7,618,139,648 (0.0%)
+[lora] Train: 200 steps, loss=0.1226, 295.55s
+/home/mathornton/micah/molly-evolve/venv/lib/python3.12/site-packages/peft/tuners/tuners_utils.py:285: UserWarning: Already found a `peft_config` attribute in the model. This will lead to having multiple adapters in the model. Make sure to know what you are doing!
+  warnings.warn(
+[lora] Trainable: 2,523,136 / 7,618,139,648 (0.0%)
+[lora] Train: 200 steps, loss=0.3426, 294.47s
+[lora] Trainable: 2,523,136 / 7,618,139,648 (0.0%)
+[lora] Train: 200 steps, loss=0.4578, 294.33s
+[qlora] Loading Qwen/Qwen2.5-7B (4-bit)...
+
+  Domain 1/3: code
+    PPL: general:4.3 | code:1.1 | legal:2.5 | medical:3.7 | GM: 2.5
+
+  Domain 2/3: legal
+    PPL: general:6.0 | code:1.1 | legal:1.1 | medical:4.9 | GM: 2.4
+
+  Domain 3/3: medical
+    PPL: general:10.8 | code:1.1 | legal:1.2 | medical:1.1 | GM: 2.0
+
+============================================================
+  Running: qlora
+============================================================
+Loading weights:   0%|          | 0/339 [00:00<?, ?it/s]Loading weights: 100%|██████████| 339/339 [00:00<00:00, 12090.41it/s]
+[qlora] Model loaded in 78.5s
+[qlora] Trainable: 2,523,136 params (rank=8)
+[qlora] Train: 200 steps, loss=0.1216, 231.13s
+[qlora] Trainable: 2,523,136 params (rank=8)
+[qlora] Train: 200 steps, loss=0.3410, 230.91s
+[qlora] Trainable: 2,523,136 params (rank=8)
+[qlora] Train: 200 steps, loss=0.4674, 231.45s
+
+  Domain 1/3: code
+    PPL: general:4.3 | code:1.1 | legal:2.5 | medical:3.7 | GM: 2.5
+
+  Domain 2/3: legal
+    PPL: general:5.8 | code:1.1 | legal:1.1 | medical:4.8 | GM: 2.4
+
+  Domain 3/3: medical
+    PPL: general:9.0 | code:1.1 | legal:1.1 | medical:1.1 | GM: 1.9
+
+============================================================
+  COMPARISON SUMMARY
+============================================================
+
+  Method         Final GM       Time
+  ------------ ---------- ----------
+  gene-conv       20306.8    2162.9s
+  lora                2.0     884.7s
+  qlora               1.9     693.5s
+
+  Winner: qlora (lowest GM perplexity)
+

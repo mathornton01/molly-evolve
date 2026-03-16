@@ -61,35 +61,52 @@ class ContinualLearner(ABC):
         self.model.eval()
         ids = enc["input_ids"].to(self.device)
         mask = enc["attention_mask"].to(self.device)
+        model_dtype = self._model_dtype()
         with torch.no_grad():
-            if self.device.type == "cuda":
+            if self.device.type == "cuda" and model_dtype == torch.bfloat16:
+                with autocast("cuda", dtype=torch.bfloat16):
+                    out = self.model(ids, attention_mask=mask, labels=ids)
+            elif self.device.type == "cuda":
                 with autocast("cuda", dtype=torch.float16):
                     out = self.model(ids, attention_mask=mask, labels=ids)
             else:
                 out = self.model(ids, attention_mask=mask, labels=ids)
         return math.exp(min(out.loss.item(), 20))  # cap at exp(20) to avoid overflow
 
-    def _model_is_fp16(self):
-        """Check if model parameters are already in fp16."""
+    def _model_dtype(self):
+        """Get the model's parameter dtype."""
         for p in self.model.parameters():
-            return p.dtype in (torch.float16, torch.bfloat16)
-        return False
+            return p.dtype
+        return torch.float32
+
+    def _model_is_fp16(self):
+        """Check if model parameters are already in fp16/bf16."""
+        return self._model_dtype() in (torch.float16, torch.bfloat16)
 
     def train_step(self, ids, mask, optimizer, scaler=None):
         """Single training step with optional AMP."""
         optimizer.zero_grad()
+        model_dtype = self._model_dtype()
         if self.device.type == "cuda" and scaler is not None and not self._model_is_fp16():
             with autocast("cuda", dtype=torch.float16):
                 out = self.model(ids, attention_mask=mask, labels=ids)
             scaler.scale(out.loss).backward()
             scaler.step(optimizer)
             scaler.update()
-        elif self.device.type == "cuda" and self._model_is_fp16():
-            # Model already fp16 — use autocast but no scaler
-            with autocast("cuda", dtype=torch.float16):
+        elif self.device.type == "cuda" and model_dtype == torch.bfloat16:
+            # bf16 model — use bf16 autocast (no scaler needed, bf16 doesn't overflow)
+            with autocast("cuda", dtype=torch.bfloat16):
                 out = self.model(ids, attention_mask=mask, labels=ids)
             out.loss.backward()
             optimizer.step()
+        elif self.device.type == "cuda" and model_dtype == torch.float16:
+            # fp16 model — use autocast with scaler to avoid NaN
+            scaler = scaler or GradScaler()
+            with autocast("cuda", dtype=torch.float16):
+                out = self.model(ids, attention_mask=mask, labels=ids)
+            scaler.scale(out.loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         else:
             out = self.model(ids, attention_mask=mask, labels=ids)
             out.loss.backward()

@@ -179,7 +179,17 @@ def cmd_compare(args):
         print(f"  Running: {method_name}")
         print(f"{'='*60}")
 
-        learner = get_method(method_name, model_name=args.model, device=device)
+        # Pass gene-conv specific args if available
+        extra_kwargs = {}
+        if method_name == "gene-conv":
+            if hasattr(args, 'max_repair_pct'):
+                extra_kwargs['max_repair_pct'] = args.max_repair_pct
+            if hasattr(args, 'gc_threshold'):
+                extra_kwargs['threshold'] = args.gc_threshold
+            if hasattr(args, 'max_grad_norm'):
+                extra_kwargs['max_grad_norm'] = args.max_grad_norm
+        learner = get_method(method_name, model_name=args.model, device=device,
+                             **extra_kwargs)
         learner.load_model()
         learner.snapshot()
 
@@ -383,6 +393,12 @@ def main():
     p_compare.add_argument("--n-eval", type=int, default=50)
     p_compare.add_argument("--device", default="cuda" if _has_cuda() else "cpu")
     p_compare.add_argument("--quicktest", action="store_true")
+    p_compare.add_argument("--max-repair-pct", type=float, default=0.03,
+                           help="Gene-conv: max %% of genes to repair per round (default: 0.03)")
+    p_compare.add_argument("--gc-threshold", type=float, default=0.50,
+                           help="Gene-conv: repair threshold (default: 0.50)")
+    p_compare.add_argument("--max-grad-norm", type=float, default=1.0,
+                           help="Gene-conv: gradient clipping norm (default: 1.0)")
     p_compare.set_defaults(func=cmd_compare)
 
     # benchmark

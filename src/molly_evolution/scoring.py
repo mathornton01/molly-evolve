@@ -359,8 +359,19 @@ class GeneScorer:
             posterior_var: scalar posterior variance
             diagnostics: dict with prior params and shrinkage factor
         """
+        # Guard against NaN/Inf in inputs
+        if np.any(np.isnan(raw_deltas)) or np.any(np.isinf(raw_deltas)):
+            logger.warning("    NaN/Inf in raw_deltas, clamping")
+            raw_deltas = np.nan_to_num(raw_deltas, nan=0.0, posinf=0.0, neginf=0.0)
+
         mu_0 = np.mean(raw_deltas)
         total_var = np.var(raw_deltas)
+
+        # Guard against degenerate cases
+        if not np.isfinite(mu_0):
+            mu_0 = 0.0
+        if not np.isfinite(total_var) or total_var < 0:
+            total_var = 0.0
 
         # Signal variance via method of moments: Var(d) = tau^2 + sigma^2
         tau2 = max(total_var - noise_var, 0.0)
@@ -368,6 +379,12 @@ class GeneScorer:
         # Shrinkage factor
         denom = tau2 + noise_var
         B = tau2 / denom if denom > 1e-10 else 0.0
+
+        # When SNR is zero but we have nonzero deltas, use a minimum
+        # shrinkage to avoid completely ignoring the data
+        if B < 1e-6 and total_var > 1e-10:
+            B = min(0.1, total_var / (total_var + noise_var + 1e-10))
+            logger.info(f"    Applied minimum shrinkage floor: B={B:.4f}")
 
         # Posterior
         posterior_mean = B * raw_deltas + (1 - B) * mu_0
