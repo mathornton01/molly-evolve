@@ -1,5 +1,5 @@
 \documentclass[9pt,letterpaper]{article}
-\usepackage[margin=0.35in,top=0.3in,bottom=0.35in]{geometry}
+\usepackage[margin=0.35in,top=0.28in,bottom=0.32in]{geometry}
 \usepackage{amsmath,amssymb}
 \usepackage{booktabs}
 \usepackage{xcolor}
@@ -45,7 +45,7 @@
 
 % ── Equation box ──
 \newcommand{\eqbox}[2]{%
-  \vspace{0pt}\begin{center}\colorbox{tint}{\parbox{0.87\linewidth}{\vspace{0pt}\begin{equation}#1\tag{#2}\end{equation}\vspace{-4pt}}}\end{center}\vspace{-2pt}}
+  \vspace{0pt}\begin{center}\colorbox{tint}{\parbox{0.95\columnwidth}{\vspace{0pt}\begin{equation}\textstyle #1\tag{#2}\end{equation}\vspace{-4pt}}}\end{center}\vspace{-2pt}}
 
 \begin{document}
 
@@ -71,7 +71,8 @@ A continual learning framework for LLMs inspired by genetic introgression in \te
   \node[box,right=of t](sc){Score}; \node[box,right=of sc](r){Repair};
   \node[box,right=of r](f){Fix};
   \draw[arr](s)--(t); \draw[arr](t)--(sc); \draw[arr](sc)--(r); \draw[arr](r)--(f);
-  \draw[arr,rounded corners=3pt](f.south)--++(0,-0.2)-|node[below,pos=0.5,lbl]{next domain}(s.south);
+  % Feedback loop on top
+  \draw[arr,rounded corners=3pt](f.north)--++(0,0.25)-|node[above,pos=0.5,lbl]{next domain}(s.north);
   \node[lbl,below=0.01 of s]{$\mathbf{w}^p\!\!\to\!\!\mathbf{w}^c$};
   \node[lbl,below=0.01 of t]{SGD};
   \node[lbl,below=0.01 of sc]{Bayes};
@@ -98,11 +99,11 @@ The Amazon Molly (\textit{P.~formosa}) reproduces asexually yet has thrived for 
 We partition model parameters into $L$ functional groups called \textbf{genes}---each attention head, MLP block, and LayerNorm is one gene ($L\!=\!928$ for 7B parameters). Two copies are maintained: the \textbf{primary} $\mathbf{w}^p$ (live trainable weights) and the \textbf{complement} $\mathbf{w}^c$ (int16-quantized snapshot from before training). Overhead: 2 bytes/parameter.
 
 \textbf{Gene scoring.}
-After fine-tuning, we estimate the effect of reverting each gene $i$ on the loss $\mathcal{L}_j$ of prior domain $j$. The gradient of the loss tells us how sensitive each parameter is to small changes; the complement--primary difference tells us how much each parameter actually changed. Their dot product gives the estimated reversion effect:
+After fine-tuning, we estimate the effect of reverting each gene $i$ on the loss $\mathcal{L}_j$ of prior domain $j$. The partial derivative of the loss with respect to each parameter tells us how sensitive the loss is to that parameter; the complement--primary difference tells us how much it changed. Summing their element-wise product over all parameters in a gene gives the estimated reversion effect:
 
-\eqbox{\delta_{ij} \;=\; \bigl\langle\, \nabla_\theta \mathcal{L}_j,\;\; \mathbf{w}^c_i - \mathbf{w}^p_i \,\bigr\rangle}{1}
+\eqbox{\delta_{ij} = \!\sum_{k \in g_i}\! \tfrac{\partial \mathcal{L}_j}{\partial \theta_k} \!\cdot\! \bigl(w^c_k - w^p_k\bigr)}{1}
 
-This is a first-order Taylor approximation. A single forward+backward pass yields $\nabla_\theta \mathcal{L}_j$ for the entire model, from which all $L\!=\!928$ gene scores are extracted by slicing. Total cost: $\mathcal{O}(N_\text{obj})$ passes, not $\mathcal{O}(L \times N_\text{obj})$.
+where $g_i$ is the set of parameter indices belonging to gene $i$. This is a first-order Taylor approximation. One forward+backward pass yields all partial derivatives, from which all $L\!=\!928$ gene scores are extracted by slicing. Cost: $\mathcal{O}(N_\text{obj})$, not $\mathcal{O}(L \!\times\! N_\text{obj})$.
 
 \textbf{Why raw scores aren't enough.}
 The score $\delta_{ij}$ depends on which evaluation samples we used---it is a noisy estimate. A gene might appear damaged purely by statistical fluctuation. Repairing based on noisy scores would introduce unnecessary changes. We need to separate genuine signal from noise.
@@ -110,14 +111,16 @@ The score $\delta_{ij}$ depends on which evaluation samples we used---it is a no
 \textbf{Bayesian shrinkage.}
 We apply \textbf{empirical Bayes} to obtain calibrated probabilities. We split evaluation data in half, score each half independently, and measure agreement (split-half correlation $r$). High agreement ($r \approx 1$) means the scores are reliable; low agreement means noise dominates. We decompose observed variance into signal $\tau^2$ and noise $\sigma^2$, then compute a shrinkage factor:
 
-\eqbox{\tau^2 = \max\!\bigl(0,\;\textrm{Var}(\delta) - \sigma^2\bigr), \quad B = \frac{\tau^2}{\tau^2 + \sigma^2}, \quad \delta^*_{ij} = B\,\delta_{ij} + (1\!-\!B)\,\mu_0}{2}
+\eqbox{\tau^2 = \max\!\bigl(0,\,\textrm{Var}(\delta) - \sigma^2\bigr),\;\; B = \tfrac{\tau^2}{\tau^2 + \sigma^2},\;\; \delta^*_{ij} = B\delta_{ij} + (1\!-\!B)\mu_0}{2}
 
 When $B \approx 1$, data has high signal-to-noise and we trust observed scores. When $B \approx 0$, noise overwhelms signal and scores are shrunk toward the mean $\mu_0$ (assuming the gene is unaffected). This prevents false-positive repairs. In our experiments, $B$ ranged from 0.75 (SNR\,=\,3.1) to 0.999 (SNR\,=\,842.5), with split-half $r = 0.83$--$0.999$.
 
 \textbf{Repair decision.}
 From the shrunk scores, we compute the posterior probability that gene $i$ is deleterious to domain $j$:
 
-\eqbox{P(\textrm{del}_{ij}) = 1 - \Phi\!\!\left(\frac{-\delta^*_{ij}}{\sqrt{\textrm{Var}_\textrm{post}}}\right)\!, \quad \textrm{Repair if}\; \max_j P(\textrm{del}_{ij}) - \alpha\, P(\textrm{ben}_i) > \theta}{3}
+\eqbox{P(\textrm{del}_{ij}) = 1 - \Phi\!\bigl(\tfrac{-\delta^*_{ij}}{\sqrt{V_\textrm{post}}}\bigr)}{3}
+
+Repair gene $i$ if $\max_j P(\textrm{del}_{ij}) - \alpha\, P(\textrm{ben}_i) > \theta$,
 
 where $\Phi$ is the normal CDF, $\alpha$ balances prior-domain protection against current-domain benefit, and $\theta$ is the repair threshold. Repair copies $\mathbf{w}^c_i \!\to\! \mathbf{w}^p_i$, reverting that gene. Capped at 15\% of genes per cycle. Genes with $P(\textrm{del}) < 0.3$ on all priors are \textbf{fixed} ($\mathbf{w}^p_i \!\to\! \mathbf{w}^c_i$), permanently accepting the change.
 
@@ -157,11 +160,8 @@ LoRA\,6d & 1.11 & 1.68 & 2.81 & 2.65 & 1.11 & 1.11 & 1.60 \\
 {\centering\scriptsize\color{ltgray}\textit{Table 2.} Per-domain PPL. At 5d, MOLLI retains all domains $\leq$ 1.25.\par}
 \vspace{2pt}
 
-\textbf{Key findings.}
-(i)~MOLLI achieves 23--24\% lower GM PPL at 3 and 5 domains.
-(ii)~At 5 domains, every prior domain stays $\leq$1.25; LoRA degrades to 2.29 (medical) and 1.83 (legal).
-(iii)~At 6 domains the gap narrows to 5\%, suggesting the fixed 15\% repair cap becomes a bottleneck with 7 simultaneous objectives; an adaptive cap would likely restore the wider gap.
-(iv)~139/928 genes repaired per cycle (15\% cap), 0--151 fixed---targeted, selective intervention.
+\textbf{Findings.}
+MOLLI achieves 23--24\% lower GM PPL at 3 and 5 domains. At 5d, all priors $\leq$1.25; LoRA degrades to 2.29/1.83. At 6d, the gap narrows (15\% repair cap bottleneck). 139/928 genes repaired per cycle---targeted, selective intervention.
 
 \end{multicols}
 
