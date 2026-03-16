@@ -109,7 +109,7 @@ def evaluate_ppl(model, enc, device):
             batch_ids = ids[i:i+4]
             batch_mask = mask[i:i+4]
             if use_amp:
-                with torch.amp.autocast("cuda", dtype=torch.float16):
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     out = model(batch_ids, attention_mask=batch_mask, labels=batch_ids)
             else:
                 out = model(batch_ids, attention_mask=batch_mask, labels=batch_ids)
@@ -155,7 +155,7 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
 
     t0 = time.perf_counter()
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.float16).to(device)
+        model_name, torch_dtype=torch.bfloat16).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     if n_params > 1e9:
         model.gradient_checkpointing_enable()
@@ -224,7 +224,7 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
             for j in range(0, ids.size(0)):
                 optimizer.zero_grad()
                 if use_amp_train:
-                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                         out = model(ids[j:j+1], attention_mask=mask[j:j+1],
                                     labels=ids[j:j+1])
                 else:
@@ -283,7 +283,7 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
         with torch.no_grad():
             for k in range(min(2, ids.size(0))):
                 if use_amp_check:
-                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                         out = model(ids[k:k+1], attention_mask=mask[k:k+1],
                                     labels=ids[k:k+1])
                 else:
@@ -356,7 +356,7 @@ def run_gene_conv(model_name, tokenizer, domain_data, all_eval_sets, domains,
             with torch.no_grad():
                 for k in range(n_test):
                     if use_amp:
-                        with torch.amp.autocast("cuda", dtype=torch.float16):
+                        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                             out = model(test_ids_all[k:k+1],
                                         attention_mask=test_mask_all[k:k+1],
                                         labels=test_ids_all[k:k+1])
@@ -489,7 +489,7 @@ def run_lora(model_name, tokenizer, domain_data, all_eval_sets, domains,
     # Load model
     t0 = time.perf_counter()
     model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.float16).to(device)
+        model_name, torch_dtype=torch.bfloat16).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     if n_params > 1e9:
         model.gradient_checkpointing_enable()
@@ -553,7 +553,7 @@ def run_lora(model_name, tokenizer, domain_data, all_eval_sets, domains,
             for j in range(0, ids.size(0)):
                 optimizer.zero_grad()
                 if use_amp_lora:
-                    with torch.amp.autocast("cuda", dtype=torch.float16):
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                         out = peft_model(ids[j:j+1], attention_mask=mask[j:j+1],
                                          labels=ids[j:j+1])
                 else:
