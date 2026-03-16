@@ -183,26 +183,38 @@ class GeneScorer:
 
     # ── Low-level scoring ────────────────────────────────────────
 
-    def _score_one_eval(self, enc) -> np.ndarray:
-        """One forward+backward -> all gene scores."""
+    def _score_one_eval(self, enc, scoring_batch_size=4) -> np.ndarray:
+        """One forward+backward -> all gene scores. Batched to limit memory."""
         t0 = time.perf_counter()
         self.model.zero_grad()
         self.model.train()
-        ids = enc["input_ids"].to(self.device)
-        mask = enc["attention_mask"].to(self.device)
+        ids_all = enc["input_ids"].to(self.device)
+        mask_all = enc["attention_mask"].to(self.device)
+        n_samples = ids_all.size(0)
 
-        # Forward+backward with optional AMP
-        if self.use_amp and self.device.type == "cuda":
-            with autocast("cuda", dtype=torch.float16):
+        # Accumulate gradients over mini-batches to limit activation memory
+        for b_start in range(0, n_samples, scoring_batch_size):
+            b_end = min(b_start + scoring_batch_size, n_samples)
+            ids = ids_all[b_start:b_end]
+            mask = mask_all[b_start:b_end]
+
+            if self.use_amp and self.device.type == "cuda":
+                with autocast("cuda", dtype=torch.float16):
+                    labels = ids.clone()
+                    labels[mask == 0] = -100
+                    out = self.model(ids, attention_mask=mask, labels=labels)
+                    # Scale loss to match full-batch average
+                    scaled_loss = out.loss * (b_end - b_start) / n_samples
+                scaled_loss.backward()
+            else:
                 labels = ids.clone()
                 labels[mask == 0] = -100
                 out = self.model(ids, attention_mask=mask, labels=labels)
-            out.loss.backward()
-        else:
-            labels = ids.clone()
-            labels[mask == 0] = -100
-            out = self.model(ids, attention_mask=mask, labels=labels)
-            out.loss.backward()
+                scaled_loss = out.loss * (b_end - b_start) / n_samples
+                scaled_loss.backward()
+
+            del ids, mask, labels, out, scaled_loss
+            torch.cuda.empty_cache()
 
         t_fwdbwd = time.perf_counter() - t0
 
