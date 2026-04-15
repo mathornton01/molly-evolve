@@ -7,6 +7,7 @@ Wraps TransformerDualGenome with automatic backend dispatch:
 """
 
 import logging
+import os
 import time
 from typing import List, Optional
 
@@ -215,6 +216,120 @@ class DualGenome:
         if to_fix:
             self.fix_genes(to_fix)
         return len(to_repair), len(to_fix)
+
+    # ── Save / Load ──────────────────────────────────────────────
+
+    # Filename for the serialized genome state inside a save directory.
+    GENOME_FILENAME = "molli_genome.pt"
+
+    def save(self, path: str):
+        """
+        Save the dual-strand genome state to disk.
+
+        Writes a single torch file containing the quantized complement and
+        primary strands plus gene metadata. Can be loaded later with
+        ``DualGenome.load(path, model)`` to resume training or redeploy.
+
+        Args:
+            path: Either a file path (``*.pt``) or a directory. If a
+                directory, the state is written to ``<dir>/molli_genome.pt``.
+        """
+        # Normalize path: if it's a directory, append the canonical filename.
+        if os.path.isdir(path) or path.endswith(os.sep) or not path.endswith(".pt"):
+            os.makedirs(path, exist_ok=True)
+            out = os.path.join(path, self.GENOME_FILENAME)
+        else:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            out = path
+
+        t0 = time.perf_counter()
+        gene_states = []
+        for gene in self._genome.genes:
+            entry = {
+                "name": gene.name,
+                "n_bits": gene.n_bits,
+                "complement": {k: v.cpu() for k, v in gene.complement.items()},
+                "primary": {k: v.cpu() for k, v in gene.primary.items()},
+                "scales": dict(gene.scales),
+                "complement_scales": dict(gene.complement_scales),
+            }
+            if hasattr(gene, "slice_defs"):
+                entry["type"] = "sliced"
+                entry["slice_defs"] = list(gene.slice_defs)
+            else:
+                entry["type"] = "full"
+                entry["param_names"] = list(gene.param_names)
+            gene_states.append(entry)
+
+        payload = {
+            "format_version": 1,
+            "n_bits": self.n_bits,
+            "granularity": self.granularity,
+            "total_genes": self.total_genes,
+            "genes": gene_states,
+        }
+        torch.save(payload, out)
+        dt = time.perf_counter() - t0
+        logger.info(f"save: {dt:.3f}s | {self.total_genes} genes -> {out}")
+        return out
+
+    @classmethod
+    def load(cls, path: str, model: nn.Module, backend: str = "auto",
+             apply_to_model: bool = True) -> "DualGenome":
+        """
+        Load a previously-saved dual-strand genome and attach it to ``model``.
+
+        The genome map is rebuilt from the model using the saved
+        ``granularity`` setting, then the complement / primary strands and
+        scales are overwritten from the file. The caller is responsible for
+        ensuring ``model`` has the same architecture as the one that
+        produced the saved state.
+
+        Args:
+            path: File path or directory containing ``molli_genome.pt``.
+            model: A freshly-loaded HuggingFace model to attach the genome to.
+            backend: Same semantics as ``DualGenome(..., backend=...)``.
+            apply_to_model: If ``True`` (default) write the primary strand
+                back to the model, which is what you want when loading a
+                standalone genome file. Set to ``False`` when ``model``
+                already holds the authoritative (lossless) weights — e.g.
+                inside :meth:`MolliTrainer.from_pretrained` — to avoid
+                introducing int16 quantization error.
+        """
+        if os.path.isdir(path):
+            file_path = os.path.join(path, cls.GENOME_FILENAME)
+        else:
+            file_path = path
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"No genome state found at {file_path}")
+
+        payload = torch.load(file_path, map_location="cpu", weights_only=False)
+        granularity = payload.get("granularity", "head")
+        n_bits = payload.get("n_bits", 16)
+
+        genome = cls(model, n_bits=n_bits, granularity=granularity,
+                     backend=backend)
+
+        saved_genes = payload.get("genes", [])
+        if len(saved_genes) != genome.total_genes:
+            raise ValueError(
+                f"Gene count mismatch: saved state has {len(saved_genes)} "
+                f"genes but the model produces {genome.total_genes}. "
+                f"Make sure you're loading into the same model architecture.")
+
+        # Overwrite quantized state gene-by-gene.
+        for gene, saved in zip(genome._genome.genes, saved_genes):
+            gene.complement = {k: v for k, v in saved["complement"].items()}
+            gene.primary = {k: v for k, v in saved["primary"].items()}
+            gene.scales = dict(saved["scales"])
+            gene.complement_scales = dict(saved["complement_scales"])
+
+        if apply_to_model:
+            # Apply the primary strand to the model so inference works
+            # immediately after loading when no model weights were provided.
+            genome._genome.apply_primary()
+        logger.info(f"load: {genome.total_genes} genes from {file_path}")
+        return genome
 
     # ── Memory estimation ───────────────────────────────────────
 

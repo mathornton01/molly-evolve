@@ -2,6 +2,55 @@
 
 A research project building a **Bayesian genetic algorithm for LLM self-evolution**, inspired by the genome repair mechanism of the Amazon Molly (*Poecilia formosa*).
 
+## Quick start — as easy as LoRA
+
+Fine-tune any HuggingFace causal LM with MOLLI's gene-conversion protection
+against catastrophic forgetting in **five lines**:
+
+```python
+from molly_evolution import MolliTrainer
+
+trainer = MolliTrainer.from_pretrained("gpt2")
+trainer.fit(train_texts=open("corpus.txt").read().split("\n"))
+trainer.save_pretrained("./my-molli-model")
+```
+
+Reload later for inference:
+
+```python
+from molly_evolution import MolliTrainer
+trainer = MolliTrainer.from_pretrained("./my-molli-model")
+print(trainer.generate("Once upon a time"))
+```
+
+### Side-by-side with LoRA (PEFT)
+
+```python
+# ── LoRA ──                                    # ── MOLLI ──
+from peft import LoraConfig, get_peft_model     from molly_evolution import MolliTrainer
+from transformers import AutoModelForCausalLM
+
+base = AutoModelForCausalLM.from_pretrained("gpt2")
+model = get_peft_model(base,                    trainer = MolliTrainer.from_pretrained("gpt2")
+    LoraConfig(r=8, target_modules=[...]))
+# ... your training loop ...                    trainer.fit(train_texts=my_texts)
+model.save_pretrained("./adapter")              trainer.save_pretrained("./my-molli-model")
+```
+
+Same number of lines, same ergonomics — **plus** MOLLI protects previously
+learned capabilities via Bayesian gene conversion instead of LoRA's dilution
+as adapters accumulate.
+
+### Or from the shell
+
+```bash
+molly train --model gpt2 --train-file corpus.txt -o ./my-molli-model
+molly generate --model ./my-molli-model --prompt "Once upon a time"
+```
+
+See `molly train --help` for the full flag list (epochs, lr, granularity,
+protect-file for multi-domain, etc.).
+
 ## Biological Inspiration
 
 The Amazon Molly is an all-female fish species that has reproduced entirely asexually for ~100,000 years without the genetic decay theory predicts. A 2026 Nature paper ("Gene conversion empowers natural selection in a clonal fish species") revealed the mechanism: **gene conversion** — a copy-paste DNA repair process where segments of one chromosome are copied to the homologous chromosome, erasing bad mutations and occasionally fixing beneficial ones. This allows natural selection to act on a clonal organism as if recombination were occurring.
@@ -59,6 +108,7 @@ molly-evolve/
 
 - [x] Repository initialized
 - [x] Biological mechanism researched
-- [ ] Formal mathematical model drafted
-- [ ] Proof-of-concept implementation
+- [x] Formal mathematical model drafted
+- [x] Proof-of-concept implementation
+- [x] LoRA-parity high-level API (`MolliTrainer`, `molly train` CLI, save/load)
 - [ ] HPC environment setup

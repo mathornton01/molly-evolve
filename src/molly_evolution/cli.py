@@ -2,6 +2,8 @@
 molly — CLI for Molly Evolution continual learning.
 
 Commands:
+  molly train     Fine-tune a model on your own data with gene conversion
+  molly generate  Generate text from a saved MOLLI checkpoint
   molly evolve    Run continual learning on sequential domains
   molly compare   Compare methods (gene-conv, lora, qlora) side-by-side
   molly benchmark Speed and memory benchmark
@@ -39,6 +41,99 @@ def geometric_mean(values):
         return 0
     log_sum = sum(math.log(v) for v in values)
     return math.exp(log_sum / len(values))
+
+
+# =================================================================
+# train command — single-task fine-tuning (LoRA-parity entry point)
+# =================================================================
+
+def _read_text_source(path):
+    """Read a text file, or a directory of .txt files, into a list of lines."""
+    import glob
+    if path is None:
+        return None
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No such file or directory: {path}")
+    if os.path.isdir(path):
+        files = sorted(glob.glob(os.path.join(path, "*.txt")))
+        if not files:
+            raise FileNotFoundError(f"No .txt files found in {path}")
+        lines = []
+        for f in files:
+            with open(f, "r", encoding="utf-8", errors="replace") as fh:
+                lines.extend(l for l in fh.read().splitlines() if l.strip())
+        return lines
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        return [l for l in fh.read().splitlines() if l.strip()]
+
+
+def cmd_train(args):
+    """Fine-tune a model on your own data with gene conversion."""
+    import torch
+    from molly_evolution import MolliTrainer
+
+    device = torch.device(args.device)
+    print(f"\n{'='*60}")
+    print(f"  Molly — Fine-tune with Gene Conversion")
+    print(f"{'='*60}")
+    print(f"  Model:      {args.model}")
+    print(f"  Train data: {args.train_file}")
+    if args.eval_file:
+        print(f"  Eval data:  {args.eval_file}")
+    if args.protect_file:
+        print(f"  Protect:    {args.protect_file}")
+    print(f"  Output:     {args.output}")
+    print(f"  Device:     {device}")
+    print()
+
+    train_texts = _read_text_source(args.train_file)
+    eval_texts = _read_text_source(args.eval_file) if args.eval_file else None
+    protect_texts = _read_text_source(args.protect_file) if args.protect_file else None
+
+    trainer = MolliTrainer.from_pretrained(
+        args.model, device=device, granularity=args.granularity)
+
+    metrics = trainer.fit(
+        train_texts=train_texts,
+        eval_texts=eval_texts,
+        protect_texts=protect_texts,
+        epochs=args.epochs,
+        lr=args.lr,
+        batch_size=args.batch_size,
+        max_length=args.max_length,
+        max_repair_pct=args.max_repair_pct,
+        threshold=args.threshold,
+        repair=not args.no_repair,
+    )
+
+    print(f"\n  loss:       {metrics['loss']:.4f}")
+    print(f"  steps:      {metrics['steps']}")
+    print(f"  train_time: {metrics['train_time']:.1f}s")
+    if "repaired" in metrics:
+        print(f"  repaired:   {metrics['repaired']} genes")
+        print(f"  fixed:      {metrics['fixed']} genes")
+
+    trainer.save_pretrained(args.output)
+    print(f"\n  Saved to:   {args.output}")
+    print(f"  Reload:     MolliTrainer.from_pretrained('{args.output}')")
+    print()
+
+
+# =================================================================
+# generate command — quick sanity-check text generation
+# =================================================================
+
+def cmd_generate(args):
+    """Generate text from a (possibly MOLLI-trained) checkpoint."""
+    import torch
+    from molly_evolution import MolliTrainer
+
+    device = torch.device(args.device)
+    trainer = MolliTrainer.from_pretrained(args.model, device=device)
+    text = trainer.generate(args.prompt, max_new_tokens=args.max_new_tokens,
+                            do_sample=args.sample,
+                            temperature=args.temperature)
+    print(text)
 
 
 # =================================================================
@@ -362,6 +457,47 @@ def main():
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     sub = parser.add_subparsers(dest="command", help="Available commands")
+
+    # train — single-task fine-tune + repair, LoRA-parity ergonomics
+    p_train = sub.add_parser(
+        "train",
+        help="Fine-tune a model on your own data with gene conversion")
+    p_train.add_argument("--model", default="gpt2",
+                         help="HuggingFace model name or local checkpoint")
+    p_train.add_argument("--train-file", required=True,
+                         help="Text file (or directory of .txt files) to train on")
+    p_train.add_argument("--eval-file", default=None,
+                         help="Held-out text file for current-domain scoring")
+    p_train.add_argument("--protect-file", default=None,
+                         help="Text file whose capabilities to preserve")
+    p_train.add_argument("--output", "-o", default="./molli-model",
+                         help="Directory to save the trained checkpoint")
+    p_train.add_argument("--epochs", type=int, default=3)
+    p_train.add_argument("--lr", type=float, default=5e-5)
+    p_train.add_argument("--batch-size", type=int, default=1)
+    p_train.add_argument("--max-length", type=int, default=256)
+    p_train.add_argument("--granularity", default="head",
+                         choices=["head", "component"],
+                         help="Gene granularity (default: head)")
+    p_train.add_argument("--max-repair-pct", type=float, default=0.03)
+    p_train.add_argument("--threshold", type=float, default=0.50)
+    p_train.add_argument("--no-repair", action="store_true",
+                         help="Skip gene conversion (pure fine-tuning only)")
+    p_train.add_argument("--device", default="cuda" if _has_cuda() else "cpu")
+    p_train.set_defaults(func=cmd_train)
+
+    # generate — quick text generation from a saved checkpoint
+    p_gen = sub.add_parser("generate",
+                           help="Generate text from a saved MOLLI checkpoint")
+    p_gen.add_argument("--model", default="./molli-model",
+                       help="Checkpoint directory or HF model id")
+    p_gen.add_argument("--prompt", required=True)
+    p_gen.add_argument("--max-new-tokens", type=int, default=64)
+    p_gen.add_argument("--sample", action="store_true",
+                       help="Enable sampling (temperature > 0)")
+    p_gen.add_argument("--temperature", type=float, default=1.0)
+    p_gen.add_argument("--device", default="cuda" if _has_cuda() else "cpu")
+    p_gen.set_defaults(func=cmd_generate)
 
     # evolve
     p_evolve = sub.add_parser("evolve", help="Run continual learning")
